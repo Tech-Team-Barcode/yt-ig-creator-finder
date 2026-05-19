@@ -1,4 +1,4 @@
-"""Influencer Finder Streamlit UI."""
+"""Influencer Finder Pro."""
 
 from __future__ import annotations
 
@@ -11,8 +11,17 @@ from io import BytesIO
 import pandas as pd
 import streamlit as st
 
-from ai_service import AIService
+from ai_service import AIService, normalize_user_search_terms
 from backend_keys import backend_key_counts, env_keys, first_non_empty, parse_keys
+from creator_history import (
+    annotate_used_creators,
+    campaign_scope,
+    clear_used_creators,
+    creator_identity_candidates,
+    filter_used_creators,
+    history_stats,
+    mark_creators_used,
+)
 from ig_scraper import run_ig_search
 from yt_scraper import run_yt_search
 
@@ -47,6 +56,24 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Map internal match_status → display label and chip class
+_STATUS_LABEL = {"high": "High", "review": "Mid", "rejected": "Low", "mid": "Mid", "low": "Low"}
+_STATUS_CLS   = {"high": "good", "review": "warn", "rejected": "bad",  "mid": "warn", "low": "bad"}
+
+
+def _status_label(status: str) -> str:
+    return _STATUS_LABEL.get(status, status.title())
+
+
+def _status_cls(status: str) -> str:
+    return _STATUS_CLS.get(status, "")
+
+
+def _normalize_status(status: str) -> str:
+    """Normalise raw match_status to high / mid / low for export."""
+    return {"high": "high", "review": "mid", "rejected": "low",
+            "mid": "mid", "low": "low"}.get(status, status)
+
 
 def init_state() -> None:
     defaults = {
@@ -56,6 +83,8 @@ def init_state() -> None:
         "ig_debug": {},
         "search_complete": False,
         "last_brief": "",
+        "last_platforms": [],
+        "history_notice": "",
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -86,6 +115,21 @@ def chip(label: str, cls: str = "") -> str:
     return f'<span class="chip {cls}">{html.escape(label)}</span>'
 
 
+def yt_plan_from_queries(queries: list[str], source: str = "user") -> list[dict]:
+    return [
+        {
+            "query": query,
+            "search_type": "video",
+            "source": source,
+            "intent_terms": [],
+            "negative_terms": [],
+            "paginate": True,
+        }
+        for query in queries
+        if query
+    ]
+
+
 def get_key_config(overrides: dict[str, str]) -> dict[str, list[str]]:
     gemini = first_non_empty(parse_keys(overrides.get("gemini")), env_keys("GEMINI_API_KEYS"), env_keys("GEMINI_API_KEY"))
     apify_discovery = first_non_empty(
@@ -114,7 +158,7 @@ def creators_to_df(creators: list[dict]) -> pd.DataFrame:
         if c.get("platform") == "instagram":
             rows.append({
                 "Platform": "Instagram",
-                "Status": c.get("match_status", ""),
+                "Status": _normalize_status(c.get("match_status", "")),
                 "Username/Handle": c.get("username", ""),
                 "Full Name": c.get("full_name", ""),
                 "Followers": c.get("followers", 0),
@@ -125,20 +169,19 @@ def creators_to_df(creators: list[dict]) -> pd.DataFrame:
                 "Email": c.get("email", ""),
                 "Phone": c.get("phone", ""),
                 "Website": c.get("external_url", ""),
-                "Local Score": c.get("local_match_score", 0),
+                "Used Before": "Yes" if c.get("_history_used") else "",
                 "AI Score": c.get("ai_score", ""),
                 "Niche Confidence": c.get("niche_confidence", 0),
                 "India Confidence": c.get("india_confidence", 0),
                 "Gender Confidence": c.get("gender_confidence", 0),
                 "Creator Confidence": c.get("creator_confidence", 0),
-                "Business Risk": c.get("business_risk", 0),
                 "Evidence": c.get("evidence", ""),
                 "Reason": c.get("reject_reason") or c.get("review_reason") or c.get("ai_reason", ""),
             })
         else:
             rows.append({
                 "Platform": "YouTube",
-                "Status": "high",
+                "Status": _normalize_status(c.get("match_status", "mid")),
                 "Username/Handle": c.get("handle", "") or c.get("channel_name", ""),
                 "Full Name": c.get("channel_name", ""),
                 "Followers": c.get("subscribers", 0),
@@ -149,15 +192,14 @@ def creators_to_df(creators: list[dict]) -> pd.DataFrame:
                 "Email": c.get("email", ""),
                 "Phone": c.get("phone", ""),
                 "Website": c.get("website") or c.get("aggregator_url", ""),
-                "Local Score": c.get("_quality_score", 0),
-                "AI Score": "",
-                "Niche Confidence": "",
-                "India Confidence": c.get("_location_score", 0),
-                "Gender Confidence": "",
+                "Used Before": "Yes" if c.get("_history_used") else "",
+                "AI Score": c.get("ai_score", ""),
+                "Niche Confidence": c.get("_niche_score", ""),
+                "India Confidence": c.get("_india_confidence", c.get("_location_score", "")),
+                "Gender Confidence": c.get("_gender_score", ""),
                 "Creator Confidence": c.get("_quality_score", 0),
-                "Business Risk": "",
-                "Evidence": c.get("video_title", ""),
-                "Reason": "",
+                "Evidence": c.get("video_title", "") or c.get("_search_query", ""),
+                "Reason": c.get("reject_reason") or c.get("review_reason") or c.get("ai_reason", ""),
             })
     return pd.DataFrame(rows)
 
@@ -173,7 +215,7 @@ def df_to_excel(df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def render_creator_card(creator: dict) -> None:
+def render_creator_card(creator: dict, selection_key: str | None = None) -> None:
     platform = creator.get("platform", "")
     if platform == "instagram":
         name = html.escape(str(creator.get("full_name") or creator.get("username", "")))
@@ -184,10 +226,11 @@ def render_creator_card(creator: dict) -> None:
         status = creator.get("match_status", "review")
         reason = html.escape(str(creator.get("reject_reason") or creator.get("review_reason") or creator.get("ai_reason") or ""))
         chips = [
-            chip(status.title(), "good" if status == "high" else "warn" if status == "review" else "bad"),
+            chip(_status_label(status), _status_cls(status)),
             chip(f"{fmt_num(followers)} followers"),
-            chip(f"Local {creator.get('local_match_score', 0)}"),
         ]
+        if creator.get("_history_used"):
+            chips.append(chip("Used before", "bad"))
         if creator.get("ai_score") not in (None, ""):
             chips.append(chip(f"AI {creator.get('ai_score')}/10"))
         if creator.get("source_hashtag"):
@@ -199,9 +242,20 @@ def render_creator_card(creator: dict) -> None:
         url = html.escape(str(creator.get("handle_url") or creator.get("channel_url") or ""), quote=True)
         followers = creator.get("subscribers", 0)
         bio = html.escape(str(creator.get("description", ""))[:220])
-        reason = ""
-        chips = [chip("High", "good"), chip(f"{fmt_num(followers)} subscribers")]
-        evidence = html.escape(str(creator.get("video_title", ""))[:260])
+        status = creator.get("match_status", "review")
+        reason = html.escape(str(creator.get("reject_reason") or creator.get("review_reason") or creator.get("ai_reason") or ""))
+        chips = [
+            chip(_status_label(status), _status_cls(status)),
+            chip(f"{fmt_num(followers)} subscribers"),
+        ]
+        if creator.get("_history_used"):
+            chips.append(chip("Used before", "bad"))
+        if creator.get("ai_score") not in (None, ""):
+            chips.append(chip(f"AI {creator.get('ai_score')}/10"))
+        if creator.get("_source"):
+            chips.append(chip(str(creator.get("_source")), "warn"))
+        evidence_text = creator.get("video_title") or ("Query: " + str(creator.get("_search_query", "")))
+        evidence = html.escape(str(evidence_text)[:260])
 
     st.markdown(
         f"""
@@ -216,12 +270,15 @@ def render_creator_card(creator: dict) -> None:
 """,
         unsafe_allow_html=True,
     )
+    if selection_key:
+        st.checkbox("Mark as used", key=selection_key)
 
 
-def render_cards(items: list[dict]) -> None:
+def render_cards(items: list[dict], selectable: bool = False) -> list[tuple[str, dict]]:
     if not items:
         st.info("No creators in this bucket.")
-        return
+        return []
+    selection_rows: list[tuple[str, dict]] = []
     cols_per_row = 2
     for start in range(0, len(items), cols_per_row):
         cols = st.columns(cols_per_row)
@@ -229,7 +286,14 @@ def render_cards(items: list[dict]) -> None:
             index = start + offset
             if index < len(items):
                 with col:
-                    render_creator_card(items[index])
+                    selection_key = None
+                    if selectable:
+                        ids = sorted(value for _, value in creator_identity_candidates(items[index]))
+                        identity = re.sub(r"[^a-zA-Z0-9_]+", "_", ids[0] if ids else str(index))
+                        selection_key = f"used_select_{index}_{identity}"
+                        selection_rows.append((selection_key, items[index]))
+                    render_creator_card(items[index], selection_key=selection_key)
+    return selection_rows
 
 
 def show_hashtag_plan(result: dict) -> None:
@@ -287,22 +351,56 @@ with st.sidebar:
     platform_choice = st.multiselect("Platforms", ["Instagram", "YouTube"], default=["Instagram", "YouTube"])
     col_a, col_b = st.columns(2)
     with col_a:
-        min_followers = st.number_input("Min followers", value=5000, step=1000, format="%d")
+        min_followers = st.number_input("Min followers/subscribers", value=10000, step=1000, format="%d")
     with col_b:
-        max_followers = st.number_input("Max followers", value=50000, step=5000, format="%d")
+        max_followers = st.number_input("Max followers/subscribers", value=500000, step=5000, format="%d")
 
     gender_override = st.selectbox("Gender override", ["Auto", "Any", "Male only", "Female only"])
     gender_map = {"Auto": None, "Any": "ANY", "Male only": "M", "Female only": "F"}
     region = st.selectbox("YouTube region", ["IN", "US", "GB", "AU", "CA", "SG", "AE"], index=0)
 
+    st.markdown("### Creator History")
+    campaign_name = st.text_input(
+        "Campaign name",
+        placeholder="Optional, used for repeat blocking",
+        help="Creators marked as used are blocked only inside this campaign scope. If blank, the brief text is used.",
+    )
+    allow_repeats = st.checkbox(
+        "Allow repeated creators",
+        value=False,
+        help="When off, creators marked as used in this campaign are skipped from new results.",
+    )
+    current_history_scope = campaign_scope(campaign_name, st.session_state.last_brief)
+    stats = history_stats(current_history_scope)
+    st.caption(f"Used in this campaign: {stats.get('used', 0)}")
+    if stats.get("used", 0):
+        if st.button("Clear used history for campaign"):
+            cleared = clear_used_creators(current_history_scope)
+            st.session_state.history_notice = f"Cleared {cleared} used creators for this campaign."
+            st.rerun()
+
     st.markdown("### Advanced")
+    known_search_terms = st.text_area(
+        "Known hashtags / search phrases",
+        height=80,
+        placeholder="#haircolor, #mensgrooming, Mumbai male grooming",
+    )
+    exclude_terms_raw = st.text_area(
+        "Exclude brands/channels",
+        height=70,
+        placeholder="Garnier Men India, Just For Men, SIMPLER Hair Color",
+    )
+    allow_international = st.checkbox("Allow international creators", value=False,
+                                       help="When on, channels from non-IN countries are kept as Mid instead of filtered out")
     posts_per_tag = st.slider("Instagram rows per hashtag", 10, 30, 30, step=5)
-    results_per_yt_query = st.slider("YouTube results per query", 10, 50, 30, step=10)
+    results_per_yt_query = st.slider("YouTube results per query", 10, 50, 50, step=10)
+    deep_yt_search = st.checkbox("YouTube deep search (page 2)", value=True,
+                                  help="Fetches a second page of results for video queries; doubles candidates, uses ~2x quota")
     verify_hashtags = st.checkbox("Verify hashtag counts with Apify analytics", value=True)
 
 
 st.title("Influencer Finder Pro")
-st.caption("Deterministic Instagram hashtag discovery plus YouTube search. Backend keys are read from environment variables by default.")
+st.caption("Platform-aware creator discovery: Instagram hashtag search + YouTube deep search. Keys from .env.")
 
 brief = st.text_area(
     "Campaign brief",
@@ -310,11 +408,19 @@ brief = st.text_area(
     height=110,
 )
 
-hashtags_ready = bool(st.session_state.analysis_result and st.session_state.analysis_result.get("hashtags_final"))
-ig_ready = "Instagram" in platform_choice and bool(keys["apify_discovery"]) and bool(keys["apify_profile"]) and hashtags_ready
-yt_ready = "YouTube" in platform_choice and bool(keys["youtube"]) and bool(st.session_state.analysis_result and st.session_state.analysis_result.get("yt_queries"))
+do_ig = "Instagram" in platform_choice
+do_yt = "YouTube" in platform_choice
+
+# Determine if analysis result is still valid for current platform selection
+analysis = st.session_state.analysis_result
+hashtags_ready = bool(analysis and analysis.get("hashtags_final"))
+yt_plan_ready = bool(analysis and (analysis.get("yt_search_plan") or analysis.get("yt_queries")))
+
+ig_search_ready = do_ig and bool(keys["apify_discovery"]) and bool(keys["apify_profile"]) and hashtags_ready
+yt_search_ready = do_yt and bool(keys["youtube"]) and yt_plan_ready
+
 analyze_ready = bool(brief and keys["gemini"])
-search_ready = bool(brief and st.session_state.analysis_result and (ig_ready or yt_ready))
+search_ready = bool(brief and analysis and (ig_search_ready or yt_search_ready))
 
 col_analyze, col_search, col_clear = st.columns([1, 1, 4])
 with col_analyze:
@@ -333,12 +439,35 @@ with col_clear:
 if brief and not keys["gemini"]:
     st.warning("No Gemini keys configured. Set GEMINI_API_KEYS or use the advanced override.")
 
+if not platform_choice:
+    st.warning("Select at least one platform (Instagram or YouTube) in the sidebar.")
+
+if st.session_state.history_notice:
+    st.success(st.session_state.history_notice)
+    st.session_state.history_notice = ""
+
 if analyze_btn:
-    with st.spinner("Analyzing brief and planning Instagram hashtags..."):
+    analysis_logs: list[str] = []
+    analysis_box = st.empty()
+
+    def add_analysis_log(message: str) -> None:
+        safe = html.escape(str(message))
+        analysis_logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {safe}")
+        analysis_box.markdown('<div class="soft-panel muted">' + "<br>".join(analysis_logs[-18:]) + "</div>", unsafe_allow_html=True)
+
+    with st.spinner("Analyzing brief and planning creator search packs..."):
         ai = AIService(keys["gemini"], keys["apify_discovery"])
-        result = ai.run_full_analysis(brief, verify_hashtags=verify_hashtags)
+        result = ai.run_full_analysis(
+            brief,
+            verify_hashtags=verify_hashtags,
+            user_search_terms=known_search_terms,
+            exclude_terms=exclude_terms_raw,
+            progress_callback=add_analysis_log,
+            platforms=platform_choice,
+        )
         st.session_state.analysis_result = result
         st.session_state.last_brief = brief
+        st.session_state.last_platforms = list(platform_choice)
         st.session_state.search_complete = False
     st.rerun()
 
@@ -352,6 +481,8 @@ if st.session_state.analysis_result:
     for key in ("niche", "secondary_niche", "city", "state", "language", "creator_tier", "confidence"):
         if intent.get(key):
             badges.append(chip(f"{key}: {intent[key]}"))
+    if intent.get("gender_mode"):
+        badges.append(chip("gender mode: " + str(intent["gender_mode"]).replace("_", " ")))
     if intent.get("gender") and intent.get("gender") != "ANY":
         badges.append(chip("gender: " + ("male" if intent["gender"] == "M" else "female")))
     st.markdown("".join(badges), unsafe_allow_html=True)
@@ -362,25 +493,52 @@ if st.session_state.analysis_result:
         f"{fmt_num(intent.get('max_followers', max_followers))}"
     )
 
-    col_tags, col_queries = st.columns(2)
-    with col_tags:
-        show_hashtag_plan(result)
-    with col_queries:
-        st.markdown('<div class="section-title">YouTube Queries</div>', unsafe_allow_html=True)
-        for i, query in enumerate(result.get("yt_queries", []), 1):
-            st.markdown(f"{i}. `{query}`")
-        st.markdown('<div class="section-title">Instagram Discovery Phrases</div>', unsafe_allow_html=True)
-        for i, query in enumerate(result.get("ig_keywords", [])[:12], 1):
-            st.markdown(f"{i}. `{query}`")
+    # ── Platform-aware analysis display ───────────────────────────────────────
+    show_ig_section = do_ig
+    show_yt_section = do_yt
+
+    if show_ig_section and show_yt_section:
+        col_tags, col_queries = st.columns(2)
+    elif show_ig_section:
+        col_tags = st.container()
+        col_queries = None
+    elif show_yt_section:
+        col_tags = None
+        col_queries = st.container()
+    else:
+        col_tags = col_queries = None
+
+    if show_ig_section and col_tags is not None:
+        with col_tags:
+            show_hashtag_plan(result)
+            st.markdown('<div class="section-title">Instagram Discovery Phrases</div>', unsafe_allow_html=True)
+            for i, query in enumerate(result.get("ig_keywords", [])[:12], 1):
+                st.markdown(f"{i}. `{query}`")
+
+    if show_yt_section and col_queries is not None:
+        with col_queries:
+            st.markdown('<div class="section-title">YouTube Queries</div>', unsafe_allow_html=True)
+            yt_plan = result.get("yt_search_plan") or yt_plan_from_queries(result.get("yt_queries", []), source="legacy")
+            for i, item in enumerate(yt_plan, 1):
+                query = item.get("query", "")
+                source = item.get("source", "")
+                stype = item.get("search_type", "video")
+                source_label = f"{stype} | {source}"
+                st.markdown(f"{i}. `{query}` <span class=\"muted\">{html.escape(source_label)}</span>", unsafe_allow_html=True)
 
     with st.expander("Edit hashtags and queries"):
-        edited_tags = st.text_area("Instagram hashtags, one per line", value="\n".join(result.get("hashtags_final", [])), height=140)
-        edited_yt = st.text_area("YouTube queries, one per line", value="\n".join(result.get("yt_queries", [])), height=140)
-        edited_ig_phrases = st.text_area("Instagram discovery phrases, one per line", value="\n".join(result.get("ig_keywords", [])), height=100)
+        if show_ig_section:
+            edited_tags = st.text_area("Instagram hashtags, one per line", value="\n".join(result.get("hashtags_final", [])), height=140)
+            edited_ig_phrases = st.text_area("Instagram discovery phrases, one per line", value="\n".join(result.get("ig_keywords", [])), height=100)
+        if show_yt_section:
+            edited_yt = st.text_area("YouTube queries, one per line", value="\n".join(result.get("yt_queries", [])), height=140)
         if st.button("Save edits"):
-            result["hashtags_final"] = [line.strip() for line in edited_tags.splitlines() if line.strip()]
-            result["yt_queries"] = [line.strip() for line in edited_yt.splitlines() if line.strip()]
-            result["ig_keywords"] = [line.strip() for line in edited_ig_phrases.splitlines() if line.strip()]
+            if show_ig_section:
+                result["hashtags_final"] = [line.strip() for line in edited_tags.splitlines() if line.strip()]
+                result["ig_keywords"] = [line.strip() for line in edited_ig_phrases.splitlines() if line.strip()]
+            if show_yt_section:
+                result["yt_queries"] = [line.strip() for line in edited_yt.splitlines() if line.strip()]
+                result["yt_search_plan"] = yt_plan_from_queries(result["yt_queries"], source="user")
             st.session_state.analysis_result = result
             st.rerun()
 
@@ -393,6 +551,7 @@ if search_btn and st.session_state.analysis_result:
         effective_gender = intent.get("gender", "ANY")
     effective_min = int(min_followers)
     effective_max = int(max_followers)
+    history_campaign = campaign_scope(campaign_name, brief)
     location_hints = [str(intent.get(k)) for k in ("city", "state", "language") if intent.get(k)]
     lang_code_map = {
         "kannada": "kn", "tamil": "ta", "telugu": "te", "malayalam": "ml",
@@ -408,12 +567,13 @@ if search_btn and st.session_state.analysis_result:
     def add_log(message: str) -> None:
         safe = html.escape(str(message))
         logs.append(f"[{datetime.now().strftime('%H:%M:%S')}] {safe}")
-        log_box.markdown('<div class="soft-panel muted">' + "<br>".join(logs[-18:]) + "</div>", unsafe_allow_html=True)
+        log_box.markdown('<div class="soft-panel muted">' + "<br>".join(logs[-22:]) + "</div>", unsafe_allow_html=True)
 
     ig_results: list[dict] = []
     yt_results: list[dict] = []
 
-    if "Instagram" in platform_choice and result.get("hashtags_final"):
+    # ── Instagram search ───────────────────────────────────────────────────────
+    if do_ig and result.get("hashtags_final"):
         if not (keys["apify_discovery"] and keys["apify_profile"]):
             add_log("Instagram skipped: missing Apify discovery/profile keys")
         else:
@@ -434,6 +594,13 @@ if search_btn and st.session_state.analysis_result:
                     progress_callback=add_log,
                     debug_state=ig_debug,
                 ))
+                ig_results, skipped_used = filter_used_creators(ig_results, history_campaign, allow_repeats)
+                if skipped_used:
+                    add_log(f"Creator history: skipped {len(skipped_used)} previously used Instagram creators")
+                elif allow_repeats and ig_results:
+                    used_count = sum(1 for c in ig_results if c.get("_history_used"))
+                    if used_count:
+                        add_log(f"Creator history: included {used_count} previously used Instagram creators")
                 st.session_state.ig_debug = ig_debug
                 result["ig_debug"] = ig_debug
                 progress.progress(45)
@@ -446,22 +613,30 @@ if search_btn and st.session_state.analysis_result:
                 add_log(
                     "Instagram done: "
                     f"{sum(1 for c in ig_results if c.get('match_status') == 'high')} high, "
-                    f"{sum(1 for c in ig_results if c.get('match_status') == 'review')} review, "
-                    f"{sum(1 for c in ig_results if c.get('match_status') == 'rejected')} rejected"
+                    f"{sum(1 for c in ig_results if c.get('match_status') in ('review', 'mid'))} mid, "
+                    f"{sum(1 for c in ig_results if c.get('match_status') in ('rejected', 'low'))} low"
                 )
             except Exception as exc:
                 add_log(f"Instagram error: {exc}")
+    elif do_ig:
+        add_log("Instagram: no hashtags from analysis — run Analyze Brief first or add known hashtags")
 
-    if "YouTube" in platform_choice and result.get("yt_queries"):
+    # ── YouTube search ─────────────────────────────────────────────────────────
+    yt_plan = result.get("yt_search_plan") or yt_plan_from_queries(result.get("yt_queries", []), source="legacy")
+    if do_yt and yt_plan:
         if not keys["youtube"]:
             add_log("YouTube skipped: missing YOUTUBE_API_KEYS")
         else:
             progress.progress(60)
-            add_log(f"YouTube: searching {len(result['yt_queries'])} queries")
+            video_count = sum(1 for item in yt_plan if item.get("search_type") == "video")
+            channel_count = sum(1 for item in yt_plan if item.get("search_type") == "channel")
+            hashtag_count = sum(1 for item in yt_plan if item.get("source") == "hashtag")
+            add_log(f"YouTube: {video_count} video + {channel_count} channel + {hashtag_count} hashtag queries")
+            add_log(f"YouTube deep search: {'enabled (page 2)' if deep_yt_search else 'disabled'}")
             try:
                 yt_results = run_async(run_yt_search(
                     api_keys=keys["youtube"],
-                    queries=result["yt_queries"],
+                    queries=result.get("yt_queries", []),
                     min_subs=effective_min,
                     max_subs=effective_max,
                     gender_filter=effective_gender,
@@ -471,10 +646,35 @@ if search_btn and st.session_state.analysis_result:
                     region=region,
                     results_per_query=results_per_yt_query,
                     progress_callback=add_log,
+                    search_plan=yt_plan,
+                    exclude_terms=result.get("exclude_terms") or normalize_user_search_terms(exclude_terms_raw),
+                    allow_international=allow_international,
+                    deep_search=deep_yt_search,
                 ))
-                add_log(f"YouTube done: {len(yt_results)} creators")
+                yt_results, skipped_used = filter_used_creators(yt_results, history_campaign, allow_repeats)
+                if skipped_used:
+                    add_log(f"Creator history: skipped {len(skipped_used)} previously used YouTube creators")
+                elif allow_repeats and yt_results:
+                    used_count = sum(1 for c in yt_results if c.get("_history_used"))
+                    if used_count:
+                        add_log(f"Creator history: included {used_count} previously used YouTube creators")
+                progress.progress(78)
+                if yt_results and keys["gemini"]:
+                    add_log(f"Gemini: ranking {len(yt_results)} YouTube candidates")
+                    scorer = AIService(keys["gemini"], keys["apify_discovery"])
+                    scoring_intent = dict(intent)
+                    scoring_intent["_brief"] = brief
+                    yt_results = scorer.score_youtube_creators_batch(yt_results, scoring_intent)
+                add_log(
+                    "YouTube done: "
+                    f"{sum(1 for c in yt_results if c.get('match_status') == 'high')} high, "
+                    f"{sum(1 for c in yt_results if c.get('match_status') in ('review', 'mid'))} mid, "
+                    f"{sum(1 for c in yt_results if c.get('match_status') in ('rejected', 'low'))} low"
+                )
             except Exception as exc:
                 add_log(f"YouTube error: {exc}")
+    elif do_yt:
+        add_log("YouTube: no search plan — run Analyze Brief first")
 
     progress.progress(100)
     st.session_state.ig_results = ig_results
@@ -486,63 +686,67 @@ if search_btn and st.session_state.analysis_result:
 
 ig_results = st.session_state.ig_results
 yt_results = st.session_state.yt_results
-all_results = ig_results + yt_results
+display_history_campaign = campaign_scope(campaign_name, brief or st.session_state.last_brief)
+all_results = annotate_used_creators(ig_results + yt_results, display_history_campaign)
+if not allow_repeats:
+    all_results = [c for c in all_results if not c.get("_history_used")]
 
 if all_results or st.session_state.search_complete:
-    st.markdown('<div class="section-title">Results</div>', unsafe_allow_html=True)
-    high_results = [c for c in ig_results if c.get("match_status") == "high"] + yt_results
-    review_results = [c for c in ig_results if c.get("match_status") == "review"]
-    rejected_results = [c for c in ig_results if c.get("match_status") == "rejected"]
+    # Sort all creators by AI score descending
+    def sort_key(c):
+        score = c.get("ai_score")
+        if isinstance(score, str):
+            try:
+                score = float(score)
+            except Exception:
+                score = 0
+        return score if score is not None else 0
 
-    m1, m2, m3, m4 = st.columns(4)
-    metrics = [
-        (m1, len(high_results), "High Match"),
-        (m2, len(review_results), "Needs Review"),
-        (m3, len(rejected_results), "Rejected Debug"),
-        (m4, sum(1 for c in all_results if c.get("email")), "Have Email"),
-    ]
-    for col, number, label in metrics:
-        with col:
-            st.markdown(f'<div class="metric-box"><div class="num">{number}</div><div class="label">{label}</div></div>', unsafe_allow_html=True)
+    sorted_results = sorted(all_results, key=sort_key, reverse=True)
 
-    df = creators_to_df(all_results)
+    m1, m2, m3 = st.columns(3)
+    with m1:
+        st.metric("Total Creators", len(sorted_results))
+    with m2:
+        st.metric("With Email", sum(1 for c in sorted_results if c.get("email")))
+    with m3:
+        avg = sum(sort_key(c) for c in sorted_results) / len(sorted_results) if sorted_results else 0
+        st.metric("Avg AI Score", f"{avg:.1f}")
+
+    df = creators_to_df(sorted_results)
     if not df.empty:
         st.download_button(
-            "Download Excel",
+            "📥 Download Excel",
             data=df_to_excel(df),
             file_name=f"influencers_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    tab_high, tab_review, tab_rejected, tab_table, tab_debug = st.tabs([
-        "High Match", "Needs Review", "Rejected Debug", "Data Table", "Funnel Debug"
-    ])
-    with tab_high:
-        render_cards(high_results)
-    with tab_review:
-        render_cards(review_results)
-    with tab_rejected:
-        render_cards(rejected_results[:80])
-    with tab_table:
-        if df.empty:
-            st.info("No rows to display.")
-        else:
-            st.dataframe(
-                df,
-                width="stretch",
-                hide_index=True,
-                column_config={
-                    "Followers": st.column_config.NumberColumn("Followers", format="%d"),
-                    "Profile URL": st.column_config.LinkColumn("Profile URL"),
-                    "Sample Post": st.column_config.LinkColumn("Sample Post"),
-                },
-            )
-    with tab_debug:
-        debug = st.session_state.ig_debug or (st.session_state.analysis_result or {}).get("ig_debug", {})
-        if debug:
-            st.json(debug)
-        else:
-            st.info("No Instagram funnel debug available yet.")
+    st.markdown('<div class="section-title">All Creators — sorted by AI Score</div>', unsafe_allow_html=True)
+    selection_rows = render_cards(sorted_results, selectable=True)
+    selected_creators = [creator for key, creator in selection_rows if st.session_state.get(key)]
+    mark_col, info_col = st.columns([1, 3])
+    with mark_col:
+        if st.button("Mark selected as used", disabled=not selected_creators):
+            marked = mark_creators_used(selected_creators, display_history_campaign, notes="Marked from Streamlit results")
+            selected_keys = set()
+            for creator in selected_creators:
+                selected_keys.update(creator_identity_candidates(creator))
+
+            def keep_unselected(row: dict) -> bool:
+                return not (creator_identity_candidates(row) & selected_keys)
+
+            if not allow_repeats:
+                st.session_state.ig_results = [c for c in st.session_state.ig_results if keep_unselected(c)]
+                st.session_state.yt_results = [c for c in st.session_state.yt_results if keep_unselected(c)]
+            for key, _ in selection_rows:
+                st.session_state[key] = False
+            st.session_state.history_notice = f"Marked {marked} creator(s) as used for this campaign."
+            st.rerun()
+    with info_col:
+        st.caption(
+            "Tick creators you used, then mark them. With repeated creators blocked, they will be skipped in future searches for this campaign."
+        )
 
 elif not st.session_state.analysis_result:
     st.info("Enter a campaign brief and analyze it to begin.")

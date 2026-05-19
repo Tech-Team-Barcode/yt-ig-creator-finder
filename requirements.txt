@@ -1,5 +1,6 @@
 streamlit>=1.35.0
-google-genai>=1.0.0
+google-genai>=2.4.0
 aiohttp>=3.9.0
 pandas>=2.0.0
 openpyxl>=3.1.0
+typing
