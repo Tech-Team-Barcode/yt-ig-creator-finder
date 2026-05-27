@@ -41,6 +41,11 @@ RELATED_PROFILE_BATCH_SIZE = 50
 RELATED_PROFILE_DEPTH = 2
 MAX_RELATED_PER_PROFILE = 50
 MAX_RELATED_PER_HOP = 1000
+IG_REELS_TERMS_LIMIT = 18
+IG_REELS_ROWS_PER_TERM = 25
+IG_CONTENT_ENRICH_LIMIT = 180
+IG_CONTENT_RELATED_SEED_LIMIT = 24
+IG_CONTENT_RELATED_LIMIT = 300
 
 INSTAGRAM_RESERVED_PATHS = {
     "about", "accounts", "developer", "direct", "directory", "emails",
@@ -249,7 +254,12 @@ async def _run_actor(
     return []
 
 
-def _normalize_post(post: dict, source_hashtag: str, content_type: str) -> Optional[dict]:
+def _normalize_post(
+    post: dict,
+    source_hashtag: str,
+    content_type: str,
+    keyword_search: bool = False,
+) -> Optional[dict]:
     owner = post.get("owner") if isinstance(post.get("owner"), dict) else {}
     username = (
         post.get("ownerUsername")
@@ -281,6 +291,7 @@ def _normalize_post(post: dict, source_hashtag: str, content_type: str) -> Optio
         "followers": _safe_int(post.get("ownerFollowersCount") or owner.get("followersCount") or owner.get("followers")),
         "likes": _safe_int(post.get("likesCount") or post.get("likes"), 0),
         "comments": _safe_int(post.get("commentsCount") or post.get("comments"), 0),
+        "views": _safe_int(post.get("videoViewCount") or post.get("videoPlayCount") or post.get("views"), 0),
         "is_private": bool(post.get("ownerIsPrivate") or owner.get("isPrivate") or owner.get("private")),
         "posts_count": _safe_int(owner.get("postsCount") or owner.get("mediaCount"), 0),
         "is_business": bool(owner.get("isBusinessAccount") or False),
@@ -291,6 +302,8 @@ def _normalize_post(post: dict, source_hashtag: str, content_type: str) -> Optio
         "location_name": str(post.get("locationName") or post.get("location") or ""),
         "source_hashtag": source_hashtag,
         "source_hashtags": [source_hashtag],
+        "source_query": source_hashtag,
+        "source_search_mode": "keyword" if keyword_search else "hashtag",
         "source_content_type": content_type,
         "external_url": "",
         "profile_url": f"https://www.instagram.com/{username}/",
@@ -331,6 +344,54 @@ async def scrape_hashtag(
         seen.add(post["username"])
         normalized.append(post)
     log(f"#{clean}: {len(rows)} {content_type} rows -> {len(normalized)} unique usernames")
+    return normalized
+
+
+def _normalize_ig_keyword(term: str) -> str:
+    """Return an actor-safe keyword token.
+
+    The Instagram hashtag actor uses the `hashtags` input even when
+    `keywordSearch` is enabled, and that field rejects spaces/punctuation.
+    """
+    clean = str(term or "").replace("#", " ").strip().lower()
+    return re.sub(r"[^a-z0-9_]", "", clean)
+
+
+async def scrape_reels_term(
+    session: aiohttp.ClientSession,
+    keys: KeyRing,
+    term: str,
+    limit: int,
+    keyword_search: bool,
+    log: Callable[[str], None],
+) -> list[dict]:
+    """Scrape Instagram reels by hashtag mode or keyword-search mode."""
+    display_term = re.sub(r"\s+", " ", str(term or "").replace("#", " ").strip().lower())
+    clean = _normalize_ig_keyword(term) if keyword_search else normalize_hashtag(term).lstrip("#")
+    if not clean:
+        return []
+    limit = max(5, min(int(limit), 50))
+    payload = {
+        "hashtags": [clean],
+        "resultsType": "reels",
+        "resultsLimit": limit,
+        "keywordSearch": bool(keyword_search),
+    }
+    rows = await _run_actor(session, ACTOR_HASHTAG, payload, keys, timeout=120, log=log)
+    seen: set[str] = set()
+    normalized: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        post = _normalize_post(row, clean, "reels", keyword_search=keyword_search)
+        if not post or post["username"] in seen:
+            continue
+        post["ig_discovery_source"] = "reel_keyword" if keyword_search else "reel_hashtag"
+        post["source_query"] = display_term or clean
+        seen.add(post["username"])
+        normalized.append(post)
+    mode = "keyword" if keyword_search else "hashtag"
+    log(f"IG reels {mode} '{clean}': {len(rows)} rows -> {len(normalized)} creator username(s)")
     return normalized
 
 
@@ -930,6 +991,304 @@ async def _scrape_figue_profiles(
     return results
 
 
+def _merge_profile_with_post_seed(profile: dict, seed: dict) -> dict:
+    merged = dict(profile)
+    source_hashtags = list(dict.fromkeys(
+        [str(tag).strip().lstrip("#").lower() for tag in (seed.get("source_hashtags") or []) if str(tag).strip()]
+        + [str(tag).strip().lstrip("#").lower() for tag in (profile.get("source_hashtags") or []) if str(tag).strip()]
+    ))
+    hashtags = list(dict.fromkeys(
+        [str(tag).strip().lstrip("#").lower() for tag in (seed.get("hashtags") or []) if str(tag).strip()]
+        + [str(tag).strip().lstrip("#").lower() for tag in (profile.get("hashtags") or []) if str(tag).strip()]
+    ))
+    seed_caption = str(seed.get("caption") or "")
+    profile_captions = str(profile.get("recent_captions") or profile.get("caption") or "")
+    merged.update({
+        "caption": _clean_text(seed_caption, profile.get("caption"))[:3000],
+        "recent_captions": _clean_text(seed_caption, profile_captions)[:3000],
+        "hashtags": hashtags,
+        "source_hashtags": source_hashtags,
+        "source_hashtag": str(seed.get("source_hashtag") or profile.get("source_hashtag") or ""),
+        "source_query": str(seed.get("source_query") or seed.get("source_hashtag") or ""),
+        "source_search_mode": str(seed.get("source_search_mode") or ""),
+        "source_content_type": str(seed.get("source_content_type") or "reels"),
+        "source_post_url": str(seed.get("post_url") or seed.get("sample_post_url") or ""),
+        "sample_post_url": str(seed.get("sample_post_url") or profile.get("sample_post_url") or ""),
+        "likes": max(_safe_int(seed.get("likes")), _safe_int(profile.get("likes"))),
+        "comments": max(_safe_int(seed.get("comments")), _safe_int(profile.get("comments"))),
+        "views": max(_safe_int(seed.get("views")), _safe_int(profile.get("views"))),
+        "location_name": str(seed.get("location_name") or profile.get("location_name") or ""),
+        "ig_discovery_source": str(
+            seed.get("ig_discovery_source")
+            or ("reel_keyword" if seed.get("source_search_mode") == "keyword" else "reel_hashtag" if seed.get("source_search_mode") == "hashtag" else "reel_content")
+        ),
+        "ig_discovery_depth": 0,
+        "ig_seed_username": profile.get("username", ""),
+        "ig_parent_username": "",
+    })
+    return merged
+
+
+async def _enrich_content_candidates_with_figue(
+    session: aiohttp.ClientSession,
+    keys: KeyRing,
+    candidates: list[dict],
+    log: Callable[[str], None],
+    max_to_enrich: int,
+) -> list[dict]:
+    selected = candidates[:max(1, int(max_to_enrich))]
+    targets = [
+        {
+            "username": candidate["username"],
+            "seed_username": candidate["username"],
+            "source_username": candidate["username"],
+            "discovery_depth": 0,
+        }
+        for candidate in selected
+        if candidate.get("username")
+    ]
+    scraped = await _scrape_figue_profiles(session, keys, targets, log)
+    seed_map = {candidate["username"]: candidate for candidate in selected if candidate.get("username")}
+    enriched: list[dict] = []
+    for raw, provenance in scraped:
+        profile = _figue_profile_to_creator(raw, provenance)
+        if not profile:
+            continue
+        seed = seed_map.get(profile["username"], {})
+        enriched.append(_merge_profile_with_post_seed(profile, seed))
+    log(f"IG reels enrichment: {len(enriched)}/{len(targets)} owner profile(s) returned")
+    return enriched
+
+
+def merge_instagram_creators(*groups: list[dict]) -> list[dict]:
+    """Deduplicate Instagram rows while keeping the strongest scored version."""
+    by_username: dict[str, dict] = {}
+    status_rank = {"high": 3, "review": 2, "mid": 2, "low": 1, "rejected": 0}
+    for group in groups:
+        for creator in group or []:
+            username = normalize_instagram_username(creator.get("username") or creator.get("profile_url"))
+            if not username:
+                continue
+            current = by_username.get(username)
+            if not current:
+                by_username[username] = dict(creator)
+                by_username[username]["username"] = username
+                continue
+            old_score = (
+                status_rank.get(str(current.get("match_status") or "").lower(), 0),
+                float(current.get("ai_final_score") or current.get("local_match_score") or 0),
+                _safe_int(current.get("followers")),
+            )
+            new_score = (
+                status_rank.get(str(creator.get("match_status") or "").lower(), 0),
+                float(creator.get("ai_final_score") or creator.get("local_match_score") or 0),
+                _safe_int(creator.get("followers")),
+            )
+            winner, loser = (dict(creator), current) if new_score > old_score else (current, creator)
+            for key in ("source_hashtags", "hashtags", "related_profiles"):
+                combined = list(dict.fromkeys((winner.get(key) or []) + (loser.get(key) or [])))
+                if combined:
+                    winner[key] = combined
+            sources = [str(winner.get("ig_discovery_source") or ""), str(loser.get("ig_discovery_source") or "")]
+            winner["ig_discovery_source"] = " + ".join(dict.fromkeys([s for s in sources if s]))
+            by_username[username] = winner
+    merged = list(by_username.values())
+    merged.sort(key=lambda c: (
+        0 if c.get("match_status") == "high" else 1 if c.get("match_status") == "review" else 2,
+        -float(c.get("ai_final_score") or c.get("local_match_score") or 0),
+        -_safe_int(c.get("followers")),
+    ))
+    return merged
+
+
+async def run_ig_reels_discovery(
+    api_key: str | Iterable[str],
+    profile_api_keys: str | Iterable[str],
+    keyword_terms: list[str],
+    hashtag_terms: list[str],
+    min_followers: int,
+    max_followers: int,
+    location_hints: list[str],
+    gender_filter: str = "ANY",
+    niche: str = "",
+    posts_per_term: int = IG_REELS_ROWS_PER_TERM,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    include_rejected: bool = False,
+    debug_state: Optional[dict] = None,
+) -> list[dict]:
+    """Discover real Instagram influencers from reel owners, then enrich profiles."""
+
+    def log(message: str) -> None:
+        print(f"[IG Reels] {message}")
+        if progress_callback:
+            try:
+                progress_callback(message)
+            except Exception:
+                pass
+
+    debug = debug_state if debug_state is not None else {}
+    debug.clear()
+    debug.update({
+        "keyword_terms": [],
+        "hashtag_terms": [],
+        "raw_posts": 0,
+        "pre_filter_candidates": 0,
+        "enriched_seed_profiles": 0,
+        "related_profiles_requested": 0,
+        "related_profiles_enriched": 0,
+        "surface_profiles": 0,
+    })
+
+    discovery_keys = KeyRing(api_key)
+    profile_keys = KeyRing(profile_api_keys)
+    if not discovery_keys.has_keys():
+        log("Missing Apify keys for Instagram reels/keyword actor")
+        return []
+    if not profile_keys.has_keys():
+        log("Missing Apify keys for Instagram profile enrichment")
+        return []
+
+    clean_keywords: list[str] = []
+    seen_keyword_tokens: set[str] = set()
+    for term in keyword_terms or []:
+        token = _normalize_ig_keyword(term)
+        display = re.sub(r"\s+", " ", str(term or "").replace("#", " ").strip().lower())
+        if token and token not in seen_keyword_tokens:
+            seen_keyword_tokens.add(token)
+            clean_keywords.append(display or token)
+    clean_hashtags: list[str] = []
+    for tag in hashtag_terms or []:
+        clean = normalize_hashtag(tag).lstrip("#")
+        if clean and clean not in clean_hashtags:
+            clean_hashtags.append(clean)
+    clean_keywords = clean_keywords[:IG_REELS_TERMS_LIMIT]
+    clean_hashtags = clean_hashtags[:IG_REELS_TERMS_LIMIT]
+    debug["keyword_terms"] = clean_keywords
+    debug["hashtag_terms"] = clean_hashtags
+
+    if not clean_keywords and not clean_hashtags:
+        log("No Instagram reels keywords or hashtags available")
+        return []
+
+    all_posts: list[dict] = []
+    async with aiohttp.ClientSession() as session:
+        semaphore = asyncio.Semaphore(3)
+
+        async def scrape_one(term: str, keyword_search: bool) -> list[dict]:
+            async with semaphore:
+                return await scrape_reels_term(
+                    session,
+                    discovery_keys,
+                    term,
+                    posts_per_term,
+                    keyword_search=keyword_search,
+                    log=log,
+                )
+
+        tasks = [
+            scrape_one(term, True) for term in clean_keywords
+        ] + [
+            scrape_one(tag, False) for tag in clean_hashtags
+        ]
+        log(f"Instagram reels: scraping {len(clean_keywords)} keyword term(s) + {len(clean_hashtags)} hashtag(s)")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                log(f"Instagram reels scrape error: {result}")
+                continue
+            all_posts.extend(result)
+
+        debug["raw_posts"] = len(all_posts)
+        if not all_posts:
+            log("Instagram reels actor returned no usable post owners")
+            return []
+
+        candidates = pre_filter_candidates(all_posts, niche)
+        debug["pre_filter_candidates"] = len(candidates)
+        log(f"Instagram reels pre-filter: {len(all_posts)} owner rows -> {len(candidates)} creator candidate(s)")
+        if _DEBUG_LOG:
+            try:
+                log_ig_raw(all_posts, candidates)
+            except Exception:
+                pass
+        if not candidates:
+            log("No Instagram reel owners passed niche/quality pre-filter")
+            return []
+
+        enriched = await _enrich_content_candidates_with_figue(
+            session,
+            profile_keys,
+            candidates,
+            log,
+            max_to_enrich=IG_CONTENT_ENRICH_LIMIT,
+        )
+        debug["enriched_seed_profiles"] = len(enriched)
+        if not enriched:
+            return []
+
+        seed_scored = post_enrich_filter(
+            enriched,
+            min_followers=min_followers,
+            max_followers=max_followers,
+            gender_filter=gender_filter,
+            location_hints=location_hints,
+            niche=niche,
+        )
+        seed_visible = apply_instagram_graph_gate(seed_scored, location_hints, include_rejected=include_rejected)
+
+        related_targets: dict[str, dict] = {}
+        quality_seeds = [
+            creator for creator in seed_visible
+            if creator.get("match_status") != "rejected"
+            and float(creator.get("local_match_score") or 0) >= 50
+        ][:IG_CONTENT_RELATED_SEED_LIMIT]
+        for creator in quality_seeds:
+            for related_username in creator.get("related_profiles", [])[:MAX_RELATED_PER_PROFILE]:
+                if related_username in related_targets or related_username in {c.get("username") for c in seed_visible}:
+                    continue
+                related_targets[related_username] = {
+                    "username": related_username,
+                    "seed_username": creator.get("ig_seed_username") or creator.get("username"),
+                    "source_username": creator.get("username"),
+                    "discovery_depth": 1,
+                }
+                if len(related_targets) >= IG_CONTENT_RELATED_LIMIT:
+                    break
+            if len(related_targets) >= IG_CONTENT_RELATED_LIMIT:
+                break
+
+        related_visible: list[dict] = []
+        debug["related_profiles_requested"] = len(related_targets)
+        if related_targets:
+            scraped_related = await _scrape_figue_profiles(session, profile_keys, list(related_targets.values()), log)
+            related_profiles: list[dict] = []
+            for raw, provenance in scraped_related:
+                creator = _figue_profile_to_creator(raw, provenance)
+                if not creator:
+                    continue
+                creator["ig_discovery_source"] = "related_from_reel_seed"
+                related_profiles.append(creator)
+            debug["related_profiles_enriched"] = len(related_profiles)
+            related_scored = post_enrich_filter(
+                related_profiles,
+                min_followers=min_followers,
+                max_followers=max_followers,
+                gender_filter=gender_filter,
+                location_hints=location_hints,
+                niche=niche,
+            )
+            related_visible = apply_instagram_graph_gate(related_scored, location_hints, include_rejected=include_rejected)
+
+    merged = merge_instagram_creators(seed_visible, related_visible)
+    debug["surface_profiles"] = len(merged)
+    log(
+        "Instagram reels complete: "
+        f"{len(seed_visible)} seed profile(s), {len(related_visible)} related profile(s), "
+        f"{len(merged)} surfaced"
+    )
+    return merged
+
+
 async def run_ig_related_search_from_youtube(
     yt_creators: list[dict],
     profile_api_keys: str | Iterable[str],
@@ -1128,7 +1487,10 @@ async def run_ig_search(
         
         # DEBUG: log all posts and pre-filter result
         if _DEBUG_LOG:
-            log_ig_raw(all_posts, candidates)
+            try:
+                log_ig_raw(all_posts, candidates)
+            except Exception:
+                pass
 
         per_tag_candidates: dict[str, int] = {tag.lstrip("#"): 0 for tag in seed_tags}
         for candidate in candidates:

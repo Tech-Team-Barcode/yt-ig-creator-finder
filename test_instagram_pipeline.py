@@ -9,8 +9,11 @@ from ig_scraper import (
     _related_usernames,
     apply_local_profile_scoring,
     instagram_seeds_from_youtube,
+    merge_instagram_creators,
     normalize_instagram_username,
     run_ig_related_search_from_youtube,
+    run_ig_reels_discovery,
+    scrape_reels_term,
 )
 
 
@@ -213,6 +216,111 @@ class YouTubeSeededInstagramDiscoveryTests(unittest.TestCase):
         surfaced = apply_instagram_graph_gate(creators, ["india"], include_rejected=False)
         self.assertEqual([row["username"] for row in surfaced], ["india.creator"])
         self.assertEqual(creators[1]["reject_reason"], "missing India/location evidence")
+
+    def test_reels_discovery_enriches_reel_owner_and_quality_related_seed(self):
+        async def fake_scrape_reels(_session, _keys, term, _limit, keyword_search, log):
+            self.assertTrue(keyword_search)
+            return [{
+                "platform": "instagram",
+                "username": "reel.creator",
+                "full_name": "Rahul Grooming",
+                "caption": "Men skincare routine in Mumbai with Minimalist sunscreen",
+                "hashtags": ["menskincare", "skincareformen"],
+                "source_hashtags": [term],
+                "source_hashtag": term,
+                "source_query": term,
+                "source_search_mode": "keyword",
+                "source_content_type": "reels",
+                "followers": 0,
+                "likes": 200,
+                "sample_post_url": "https://www.instagram.com/reel/abc/",
+                "profile_url": "https://www.instagram.com/reel.creator/",
+                "enriched": False,
+            }]
+
+        raw_by_username = {
+            "reel.creator": {
+                "username": "reel.creator",
+                "full_name": "Rahul Grooming",
+                "biography": "Mumbai men's grooming creator | collab hello@rahul.in",
+                "followersCount": 22000,
+                "postsCount": 45,
+                "category_name": "Digital creator",
+                "latestPosts": [{"caption": "Skincare routine for men #menskincare", "url": "https://www.instagram.com/p/abc/"}],
+                "edge_related_profiles": ["related.creator"],
+            },
+            "related.creator": {
+                "username": "related.creator",
+                "full_name": "Aman Skincare",
+                "biography": "India skincare creator",
+                "followersCount": 18000,
+                "postsCount": 30,
+                "category_name": "Digital creator",
+                "latestPosts": [{"caption": "Minimalist serum review #skincareformen", "url": "https://www.instagram.com/p/def/"}],
+                "edge_related_profiles": [],
+            },
+        }
+
+        async def fake_scrape_profiles(_session, _keys, targets, _log):
+            return [(raw_by_username[target["username"]], target) for target in targets]
+
+        debug = {}
+        with patch("ig_scraper.scrape_reels_term", new=fake_scrape_reels), patch("ig_scraper._scrape_figue_profiles", new=fake_scrape_profiles):
+            results = asyncio.run(run_ig_reels_discovery(
+                api_key=["token"],
+                profile_api_keys=["token"],
+                keyword_terms=["mens skincare india"],
+                hashtag_terms=[],
+                min_followers=10000,
+                max_followers=50000,
+                location_hints=["india", "mumbai"],
+                gender_filter="M",
+                niche="menskincare",
+                include_rejected=False,
+                debug_state=debug,
+            ))
+
+        by_username = {row["username"]: row for row in results}
+        self.assertIn("reel.creator", by_username)
+        self.assertIn("related.creator", by_username)
+        self.assertEqual(by_username["reel.creator"]["ig_discovery_source"], "reel_keyword")
+        self.assertEqual(by_username["related.creator"]["ig_discovery_source"], "related_from_reel_seed")
+        self.assertEqual(debug["raw_posts"], 1)
+        self.assertEqual(debug["related_profiles_enriched"], 1)
+
+    def test_keyword_reels_payload_uses_actor_safe_token(self):
+        captured = {}
+
+        async def fake_run_actor(_session, _actor_id, payload, _keys, timeout, log):
+            captured.update(payload)
+            return [{
+                "ownerUsername": "creator.safe",
+                "caption": "Skincare routine India #menskincare",
+                "url": "https://www.instagram.com/reel/safe/",
+            }]
+
+        with patch("ig_scraper._run_actor", new=fake_run_actor):
+            results = asyncio.run(scrape_reels_term(
+                session=None,
+                keys=["token"],
+                term="skincare routine india",
+                limit=5,
+                keyword_search=True,
+                log=lambda _message: None,
+            ))
+
+        self.assertEqual(captured["hashtags"], ["skincareroutineindia"])
+        self.assertTrue(captured["keywordSearch"])
+        self.assertEqual(results[0]["source_query"], "skincare routine india")
+
+    def test_merge_instagram_creators_keeps_strongest_duplicate(self):
+        merged = merge_instagram_creators(
+            [{"username": "creator.one", "match_status": "review", "local_match_score": 55, "source_hashtags": ["a"]}],
+            [{"username": "creator.one", "match_status": "high", "local_match_score": 80, "source_hashtags": ["b"]}],
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0]["match_status"], "high")
+        self.assertEqual(merged[0]["source_hashtags"], ["b", "a"])
 
 
 if __name__ == "__main__":

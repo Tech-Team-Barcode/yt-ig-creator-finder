@@ -1746,13 +1746,13 @@ from creator_history import (
     mark_creators_used,
 )
 from ui_table import render_creator_table
-from ig_scraper import run_ig_related_search_from_youtube, run_ig_search
+from ig_scraper import merge_instagram_creators, run_ig_related_search_from_youtube, run_ig_reels_discovery, run_ig_search
 from yt_scraper import run_yt_search
 from scrapingbee_scraper import run_scrapingbee_search
 
 
 st.set_page_config(
-    page_title="Influencer Finder Pro",
+    page_title="Influencer Radar",
     page_icon="IF",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -1862,6 +1862,109 @@ def yt_plan_from_queries(queries: list[str], source: str = "user") -> list[dict]
         for query in queries
         if query
     ]
+
+
+def _compact_ig_hashtag(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "", str(value or "").replace("#", "")).lower()
+
+
+def build_instagram_reels_terms(
+    result: dict,
+    intent: dict,
+    brief: str,
+    user_terms: list[str],
+    ai_svc: AIService | None,
+) -> tuple[list[str], list[str]]:
+    """Build Instagram keyword and hashtag searches from the same campaign brief."""
+    keyword_terms: list[str] = []
+    hashtag_terms: list[str] = []
+
+    def add_keyword(term: object) -> None:
+        clean = re.sub(r"\s+", " ", str(term or "").replace("#", " ").strip().lower())
+        if 4 <= len(clean) <= 80 and clean not in keyword_terms:
+            keyword_terms.append(clean)
+
+    def add_hashtag(term: object) -> None:
+        clean = _compact_ig_hashtag(str(term or ""))
+        if 3 <= len(clean) <= 40 and clean not in hashtag_terms:
+            hashtag_terms.append(clean)
+
+    for term in result.get("ig_keywords") or []:
+        add_keyword(term)
+    if ai_svc and not keyword_terms:
+        try:
+            for term in ai_svc.generate_ig_keywords(intent, brief):
+                add_keyword(term)
+        except Exception:
+            pass
+
+    for term in user_terms:
+        if str(term).strip().startswith("#"):
+            add_hashtag(term)
+        else:
+            add_keyword(term)
+
+    niche = str(intent.get("niche") or "").strip().lower()
+    secondary = str(intent.get("secondary_niche") or "").strip().lower()
+    gender = str(intent.get("gender") or "ANY").upper()
+    locations = [str(x).strip().lower() for x in (intent.get("locations_list") or []) if str(x).strip()]
+    if not locations:
+        locations = [
+            str(intent.get(key) or "").strip().lower()
+            for key in ("city", "state", "language")
+            if str(intent.get(key) or "").strip()
+        ]
+    if "india" not in locations:
+        locations.append("india")
+
+    base_topics = [topic for topic in (niche, secondary) if topic]
+    if not base_topics:
+        base_topics = ["lifestyle creator"]
+
+    for topic in base_topics[:3]:
+        add_keyword(f"{topic} india")
+        add_keyword(f"{topic} creator india")
+        add_keyword(f"{topic} review")
+        add_keyword(f"{topic} routine")
+        add_keyword(f"{topic} reels")
+        for loc in locations[:4]:
+            add_keyword(f"{topic} {loc} creator")
+        if gender == "M":
+            add_keyword(f"men {topic} india")
+            add_keyword(f"male {topic} creator")
+        elif gender == "F":
+            add_keyword(f"women {topic} india")
+            add_keyword(f"female {topic} creator")
+
+    for tag in (
+        result.get("hashtags_final") or []
+    ) + (
+        result.get("brand_campaign_tags") or []
+    ) + (
+        result.get("trending_creator_tags") or []
+    ):
+        add_hashtag(tag)
+
+    for topic in base_topics[:3]:
+        compact_topic = _compact_ig_hashtag(topic)
+        if compact_topic:
+            add_hashtag(compact_topic)
+            add_hashtag(f"{compact_topic}india")
+            add_hashtag(f"indian{compact_topic}")
+            add_hashtag(f"{compact_topic}reels")
+            add_hashtag(f"{compact_topic}review")
+        for loc in locations[:4]:
+            compact_loc = _compact_ig_hashtag(loc)
+            if compact_topic and compact_loc:
+                add_hashtag(f"{compact_topic}{compact_loc}")
+    if gender == "M":
+        add_hashtag("mensgroomingindia")
+        add_hashtag("indianmenstyle")
+    elif gender == "F":
+        add_hashtag("indianbeautyblogger")
+        add_hashtag("indianwomenfashion")
+
+    return keyword_terms[:18], hashtag_terms[:18]
 
 
 def get_key_config(overrides: dict[str, str]) -> dict[str, list[str]]:
@@ -2674,7 +2777,7 @@ st.markdown(
     <span class="logo-bar"><span class="logo-bar-bg">BAR</span>CODE</span>
     <span class="logo-divider">|</span>
     <span class="logo-ykone">Ykone</span>
-    <span class="logo-product-name">Scout</span>
+    <span class="logo-product-name">Influencer Radar</span>
   </div>
   <div class="quota-wrap">
     <span class="quota-label">API Quota</span>
@@ -3170,10 +3273,49 @@ if search_btn and st.session_state.analysis_result:
         with yt_tab:
             st.warning("YouTube skipped: missing YOUTUBE_API_KEYS and SCRAPINGBEE_KEYS")
 
+    ig_debug: dict = {"reels": {}, "youtube_graph": {}}
+    ig_reels_results: list[dict] = []
+    ig_graph_results: list[dict] = []
+    ig_content_keys = first_non_empty(keys["apify_discovery"], keys["apify_ig_related"])
+    ig_profile_keys = first_non_empty(keys["apify_ig_related"], keys["apify_profile"], keys["apify_discovery"])
+
+    if ig_content_keys and ig_profile_keys:
+        try:
+            ig_keyword_terms, ig_hashtag_terms = build_instagram_reels_terms(
+                result,
+                intent,
+                brief,
+                user_extra_terms,
+                ai_svc,
+            )
+            add_log(
+                "Instagram reels: "
+                f"{len(ig_keyword_terms)} keyword search(es), {len(ig_hashtag_terms)} hashtag search(es)"
+            )
+            ig_reels_results = run_async(run_ig_reels_discovery(
+                api_key=ig_content_keys,
+                profile_api_keys=ig_profile_keys,
+                keyword_terms=ig_keyword_terms,
+                hashtag_terms=ig_hashtag_terms,
+                min_followers=effective_min,
+                max_followers=effective_max,
+                location_hints=location_hints,
+                gender_filter=effective_gender,
+                niche=intent.get("niche", ""),
+                posts_per_term=25,
+                include_rejected=False,
+                progress_callback=add_log,
+                debug_state=ig_debug["reels"],
+            ))
+        except Exception as exc:
+            with ig_tab:
+                log_box_ig.error(f"Instagram reels error: {exc}")
+    else:
+        add_log("Instagram reels skipped: missing Apify discovery/profile keys")
+
     if keys["apify_ig_related"]:
         try:
-            ig_debug: dict = {}
-            ig_results = run_async(run_ig_related_search_from_youtube(
+            ig_graph_results = run_async(run_ig_related_search_from_youtube(
                 yt_creators=yt_results,
                 profile_api_keys=keys["apify_ig_related"],
                 min_followers=effective_min,
@@ -3181,26 +3323,30 @@ if search_btn and st.session_state.analysis_result:
                 location_hints=location_hints,
                 gender_filter=effective_gender,
                 niche=intent.get("niche", ""),
-                related_depth=2,
-                max_related_per_profile=50,
-                max_related_per_hop=1000,
+                related_depth=1,
+                max_related_per_profile=35,
+                max_related_per_hop=400,
                 include_rejected=False,
                 progress_callback=add_log,
-                debug_state=ig_debug,
+                debug_state=ig_debug["youtube_graph"],
             ))
-            st.session_state.ig_debug = ig_debug
-            result["ig_debug"] = ig_debug
-            ig_results, _ = filter_used_creators(ig_results, history_campaign, allow_repeats)
-            if ig_results and ai_svc:
-                add_log(f"Gemini: ranking {len(ig_results)} Instagram graph candidates...")
-                scoring_intent = dict(intent)
-                scoring_intent["_brief"] = brief
-                ig_results = ai_svc.score_creators_batch(ig_results, scoring_intent)
         except Exception as exc:
             with ig_tab:
-                log_box_ig.error(f"Instagram error: {exc}")
+                log_box_ig.error(f"Instagram graph error: {exc}")
     else:
         add_log("Instagram graph skipped: missing APIFY_IG_RELATED_KEYS")
+
+    ig_results = merge_instagram_creators(ig_reels_results, ig_graph_results)
+    st.session_state.ig_debug = ig_debug
+    result["ig_debug"] = ig_debug
+    if ig_results:
+        add_log(f"Instagram merged: {len(ig_results)} creator profile(s) before history/AI ranking")
+        ig_results, _ = filter_used_creators(ig_results, history_campaign, allow_repeats)
+        if ig_results and ai_svc:
+            add_log(f"Gemini: ranking {len(ig_results)} Instagram candidates...")
+            scoring_intent = dict(intent)
+            scoring_intent["_brief"] = brief
+            ig_results = ai_svc.score_creators_batch(ig_results, scoring_intent)
 
     st.session_state.ig_results = ig_results
     st.session_state.yt_results = yt_results
@@ -3247,7 +3393,7 @@ def _render_results_panel(items: list[dict], label: str) -> None:
             f"""
 <div class="empty-state">
   <h3>Find Real Influencers</h3>
-  <p>Explain your campaign, add any must-have keywords, and search.<br>Scout will find matching YouTube and Instagram creators.</p>
+  <p>Explain your campaign, add any must-have keywords, and search.<br>It will find matching YouTube and Instagram creators.</p>
   <div class="empty-tip">Mark Used = avoid repeats in the same campaign</div>
   <div class="empty-tip">Download Excel for your final shortlist</div>
 </div>
