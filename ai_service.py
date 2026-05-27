@@ -23,12 +23,21 @@ from google import genai
 from google.genai import types as genai_types
 from backend_keys import KeyRing, parse_keys
 from hashtag_planner import plan_hashtags
+from yt_scraper import INDIA_LOCATION_MAP
 
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────────
+CREATOR_TIERS: dict[str, tuple[int, int]] = {
+    "nano": (1_000, 10_000),
+    "micro": (10_000, 100_000),
+    "mid": (100_000, 500_000),
+    "macro": (500_000, 5_000_000),
+    "any": (10_000, 500_000),
+}
+
 GEMINI_MODEL = "gemini-3.1-flash-lite"
 MIN_HASHTAG_POSTS = 10_000       # Tags with fewer posts are filtered out
 MAX_HASHTAGS_TO_VERIFY = 30      # We ask Gemini for this many, verify all, return best
@@ -120,7 +129,7 @@ def resolve_gender_intent(brief: str, parsed_intent: Optional[dict] = None) -> d
         return {
             "gender": "M",
             "gender_mode": "male_only",
-            "gender_reason": "Brief contains male/men/grooming creator intent.",
+            "gender_reason": "Brief contains male/men creator intent.",
         }
     if parsed_gender == "F":
         return {
@@ -142,20 +151,55 @@ def resolve_gender_intent(brief: str, parsed_intent: Optional[dict] = None) -> d
 
 
 def apply_gender_intent(intent: dict, brief: str) -> dict:
-    """Attach deterministic gender fields to a parsed campaign intent."""
+    """Attach deterministic gender fields and tier ranges to a parsed campaign intent."""
     fixed = dict(intent or {})
     resolved = resolve_gender_intent(brief, fixed)
     fixed.update(resolved)
+
+    if not fixed.get("locations_list"):
+        city = fixed.get("city")
+        state = fixed.get("state")
+        locs: list[str] = []
+        for val in (city, state):
+            if val:
+                for part in _split_location_value(str(val)):
+                    if part not in locs:
+                        locs.append(part)
+        fixed["locations_list"] = locs
+
     has_explicit_size = bool(re.search(
         r"\b(?:\d+\s*[kKmM]?|followers?|subscribers?|subs|nano|micro|mid|macro)\b",
         brief or "",
     ))
-    if has_explicit_size:
-        fixed.setdefault("min_followers", 10_000)
-        fixed.setdefault("max_followers", 500_000)
+
+    range_match = re.search(
+        r"(\d+[\s]*[kKmM]?)\s*(?:to|-)\s*(\d+[\s]*[kKmM]?)",
+        brief or "",
+    )
+    if range_match:
+        def parse_k(s: str) -> int:
+            s = s.strip().lower().replace(" ", "")
+            if s.endswith("m"):
+                return int(float(s[:-1]) * 1_000_000)
+            if s.endswith("k"):
+                return int(float(s[:-1]) * 1_000)
+            return int(s) if s.isdigit() else 0
+
+        lo = parse_k(range_match.group(1))
+        hi = parse_k(range_match.group(2))
+        if lo > 0 and hi > lo:
+            fixed["min_followers"] = lo
+            fixed["max_followers"] = hi
+            return fixed
+
+    tier = str(fixed.get("creator_tier") or "any").lower().split()[0]
+    lo, hi = CREATOR_TIERS.get(tier, CREATOR_TIERS["any"])
+    if has_explicit_size and not range_match:
+        fixed.setdefault("min_followers", lo)
+        fixed.setdefault("max_followers", hi)
     else:
-        fixed["min_followers"] = 10_000
-        fixed["max_followers"] = 500_000
+        fixed["min_followers"] = lo
+        fixed["max_followers"] = hi
     return fixed
 
 
@@ -195,8 +239,9 @@ Return ONLY valid JSON (no markdown, no explanation) with this exact structure:
   "niche": "primary content niche (e.g. skincare, fashion, fitness, food, travel, tech, beauty, lifestyle, mensgrooming, menskincare)",
   "secondary_niche": "secondary niche if present, else null",
   "language": "regional language if mentioned (kannada, tamil, telugu, malayalam, marathi, punjabi, gujarati, bengali, hindi) else null",
-  "city": "specific city in lowercase if mentioned, else null",
-  "state": "state name if deducible, else null",
+  "locations_list": ["ALL cities/states/regions explicitly mentioned in brief, lowercase. If Maharashtra, Gujarat AND Delhi are all mentioned, list all three. If none mentioned, use []"],
+  "city": "first city explicitly mentioned, lowercase, else null",
+  "state": "first state explicitly mentioned, lowercase, else null",
   "gender": "M if clearly male-focused, F if clearly female-focused, ANY otherwise",
   "gender_mode": "male_only | female_only | mixed_balanced | neutral_any",
   "creator_tier": "nano (1K-10K) | micro (10K-100K) | mid (100K-500K) | macro (500K+) | any",
@@ -294,7 +339,7 @@ Generate tags in these categories:
 4. CREATOR COMMUNITY (2-3 tags)
    Tags the creator community uses: #indiancontentcreator, #microinfluencer, #nanoinfluencer
 
-{"CRITICAL: Gender is MALE — include male-specific niche tags like #menskincare #skincareformen #beardgang #mensgrooming" if gender_context == 'MALE creators only' else ""}
+{"CRITICAL: Gender is MALE — keep creator gender male, but only include grooming/skincare tags if the niche is grooming or skincare." if gender_context == 'MALE creators only' else ""}
 {"CRITICAL: Gender is FEMALE — include female-specific niche tags" if gender_context == 'FEMALE creators only' else ""}
 
 Return ONLY a JSON array of hashtag strings with # prefix. No explanation. No markdown.
@@ -302,6 +347,50 @@ Example: ["#indianmenskincare", "#mensgroomingIndia", "#skincareformen", "#mumba
 
 
 # ─── YOUTUBE QUERY GENERATION PROMPT ─────────────────────────────────────────
+def build_brand_hashtag_prompt(intent: dict, brief: str) -> str:
+    """Grounded-search prompt to find brand campaign hashtags and current niche hashtags."""
+    niche = intent.get("niche", "lifestyle")
+    gender = intent.get("gender", "ANY")
+    locations = intent.get("locations_list", []) or []
+    loc_str = ", ".join(str(loc) for loc in locations[:4]) if locations else "India"
+    noise_words = {
+        "Need", "Find", "Looking", "India", "Delhi", "Mumbai", "Gujarat",
+        "Maharashtra", "Male", "Female", "Micro", "Nano", "Mid", "Macro",
+        "Any", "YouTube", "Instagram", "Creator", "Creators", "Influencer",
+        "Campaign", "Based", "And", "For", "The", "With",
+    }
+    brand_mentions = [
+        brand for brand in re.findall(r"\b([A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z]{2,})*)\b", brief or "")
+        if brand not in noise_words
+    ][:5]
+    gender_ctx = "male" if gender == "M" else "female" if gender == "F" else "any-gender"
+    return f"""You are an Indian influencer marketing expert with live Google Search access.
+
+Campaign Brief: "{brief}"
+Niche: {niche} | Location: {loc_str} | Gender: {gender_ctx}
+Brands mentioned: {brand_mentions if brand_mentions else ["none explicitly mentioned"]}
+
+Use Google Search to find right now:
+
+1. BRAND CAMPAIGN HASHTAGS only if a brand is explicitly mentioned above.
+   Search: "[brand name] Instagram hashtag campaign 2025 OR 2026 India"
+   Find active seasonal/campaign hashtags like #WOWSkinChallenge2026.
+   Only include if they appear to have actual Instagram usage.
+   Leave brand_campaign_tags empty [] if no brand is mentioned or found.
+
+2. TRENDING CREATOR HASHTAGS for {niche} creators in India.
+   Search: "trending Instagram hashtags {niche} India creators 2025 2026"
+   Find mid-size tags (10K-500K posts) that {gender_ctx} Indian creators use now.
+   These should feel like tags a real creator puts in their caption.
+
+Return ONLY a valid JSON object, no markdown, no explanation:
+{{
+  "brand_campaign_tags": ["#tag1", "#tag2"],
+  "trending_creator_tags": ["#tag1", "#tag2", "#tag3", "#tag4", "#tag5"],
+  "source_note": "1-2 sentence summary of what Google Search found"
+}}"""
+
+
 def normalize_user_search_terms(raw_terms: str | list[str] | tuple[str, ...] | None) -> list[str]:
     """Normalize optional user-entered hashtags/search phrases without splitting phrases on spaces."""
     if raw_terms is None:
@@ -338,23 +427,71 @@ def _split_location_value(value: str) -> list[str]:
     return [re.sub(r"\s+", " ", p.strip().lower()) for p in parts if p.strip()]
 
 
+def _expand_yt_location_term(term: str) -> list[str]:
+    clean = re.sub(r"\s+", " ", str(term or "").strip().lower())
+    if not clean:
+        return []
+    for state_key, terms in INDIA_LOCATION_MAP.items():
+        if clean == state_key.replace("_", " ") or clean in terms:
+            return list(terms)
+    return [clean]
+
+
 def get_yt_location_terms(intent: dict, brief: str) -> list[str]:
-    """Collect explicit and inferred India/location terms for query planning."""
+    """
+    Collect explicit and inferred India/location terms for query planning.
+    Uses locations_list (multi-location) when available, falls back to city/state.
+    Mirrors the expanded-hints strategy from the GAS reference system.
+    """
     terms: list[str] = []
-    for key in ("city", "state", "language"):
-        value = intent.get(key)
-        if value:
-            terms.extend(_split_location_value(value))
+    seen: set[str] = set()
+
+    def add(val: str) -> None:
+        v = str(val or "").strip().lower()
+        if v and v not in seen:
+            seen.add(v)
+            terms.append(v)
+
+    explicit_parts: list[str] = []
+
+    def add_explicit_part(val: str) -> None:
+        for part in _split_location_value(str(val)):
+            add(part)
+            if part not in explicit_parts:
+                explicit_parts.append(part)
+
+    locations_list = intent.get("locations_list") or []
+    for loc in locations_list:
+        add_explicit_part(str(loc))
+
+    if not locations_list:
+        for key in ("city", "state", "language"):
+            value = intent.get(key)
+            if value:
+                add_explicit_part(str(value))
+
+    for part in explicit_parts:
+        expanded = [term for term in _expand_yt_location_term(part) if term != part]
+        for term in expanded[:2]:
+            add(term)
+
+    for part in explicit_parts:
+        for term in _expand_yt_location_term(part):
+            add(term)
+
+    lang = intent.get("language")
+    if lang:
+        add(str(lang).lower())
 
     text = f"{brief} {json.dumps(intent, ensure_ascii=False)}".lower()
     for term in KNOWN_LOCATION_TERMS:
-        if term in text and term not in terms:
-            terms.append(term)
+        if re.search(rf"\b{re.escape(term)}\b", text):
+            add(term)
 
     for default_term in ("india", "indian", "hindi"):
-        if default_term not in terms:
-            terms.append(default_term)
-    return [t for t in terms if t]
+        add(default_term)
+
+    return terms
 
 
 def _gender_mode(intent: dict) -> str:
@@ -416,19 +553,34 @@ def get_yt_topic_terms(intent: dict, brief: str) -> list[str]:
         if term and term not in topics:
             topics.append(term)
 
+    def has(pattern: str) -> bool:
+        return bool(re.search(pattern, text))
+
+    if has(r"\btravel(?:ling|er|ers)?\b|\btrip\b|\btour\b|\bbackpack(?:ing|er)?\b|\bhotel\b|\bresort\b"):
+        for term in ("travel vlog", "travel creator", "trip vlog", "travel lifestyle"):
+            add(term)
+    if has(r"\blifestyle\b"):
+        if gender == "M":
+            add("men lifestyle")
+        elif gender == "F":
+            add("women lifestyle")
+        else:
+            add("lifestyle vlog")
+        add("lifestyle creator")
+
     if re.search(r"hair\s*colou?r|hair\s*dye|indigo|burgundy|black naturals", text):
         for term in ("hair color", "hair colour", "hair dye", "hair transformation", "hair color review"):
             add(term)
-    if "hair" in text:
+    if has(r"\bhair\b"):
         for term in ("hair care", "hair styling", "hair routine"):
             add(term)
-    if "facewash" in text or "face wash" in text or "cleanser" in text:
+    if has(r"\bface\s*wash\b|\bfacewash\b|\bcleanser\b"):
         for term in ("face wash", "cleanser", "skincare routine"):
             add(term)
-    if "groom" in text or gender == "M":
+    if has(r"\bgroom(?:ing)?\b|\bbeard\b|\bshav(?:e|ing)\b"):
         for term in ("mens grooming", "male grooming", "grooming routine", "beard care"):
             add(term)
-    if "skin" in text:
+    if has(r"\bskin(?:care)?\b|\bface care\b"):
         if gender == "M":
             for term in ("men skincare", "skincare for men", "face care for men"):
                 add(term)
@@ -438,7 +590,7 @@ def get_yt_topic_terms(intent: dict, brief: str) -> list[str]:
         else:
             for term in ("skincare routine", "skin care review"):
                 add(term)
-    if "fashion" in text or "style" in text:
+    if has(r"\bfashion\b|\bstyle\b"):
         if gender == "M":
             for term in ("men fashion", "men style", "mens fashion"):
                 add(term)
@@ -449,26 +601,17 @@ def get_yt_topic_terms(intent: dict, brief: str) -> list[str]:
             for term in ("fashion haul", "style vlog", "fashion review"):
                 add(term)
     if gender == "F" or mode == "mixed_balanced":
-        if "beauty" in text or "skin" in text or "fashion" in text:
+        if has(r"\bbeauty\b|\bskin(?:care)?\b|\bfashion\b"):
             for term in ("beauty routine", "grwm", "makeup review"):
                 add(term)
-    if "lifestyle" in text:
-        if gender == "M":
-            add("men lifestyle")
-        elif gender == "F":
-            add("women lifestyle")
-        else:
-            add("lifestyle vlog")
     if not topics:
         if gender == "M":
             add("men lifestyle")
-            add("mens grooming")
         elif gender == "F":
             add("women lifestyle")
-            add("beauty creator")
         else:
             add("lifestyle creator")
-            add("skincare creator")
+        add("content creator")
     return topics[:10]
 
 
@@ -569,66 +712,71 @@ def build_deterministic_yt_search_plan(intent: dict, brief: str) -> list[dict]:
     """Curated fallback plan for Indian creator discovery with explicit gender modes."""
     topic_terms = get_yt_topic_terms(intent, brief)
     location_terms = get_yt_location_terms(intent, brief)
-    local_terms = [t for t in location_terms if t not in {"india", "indian"}][:4]
+    local_terms = [t for t in location_terms if t not in {"india", "indian", "hindi"}][:8]
     gender = str(intent.get("gender") or "ANY").upper()
     mode = _gender_mode(intent)
     tokens = _gender_query_tokens(intent)
 
     plan: list[dict] = []
     for topic in topic_terms[:4]:
-        for loc in local_terms:
-            intent_terms = [topic, loc] + location_terms[:3]
-            for token in tokens[:2]:
-                creator_topic = _gendered_query(topic, intent, token)
+        for token in tokens[:2]:
+            creator_topic = _gendered_query(topic, intent, token)
+            for loc in local_terms:
+                intent_terms = [topic, loc] + location_terms[:3]
                 plan.append(_make_plan_item(f"{creator_topic} {loc}", "video", "deterministic", intent_terms))
+            for loc in local_terms:
+                intent_terms = [topic, loc] + location_terms[:3]
+                creator_topic = _gendered_query(topic, intent, token)
                 plan.append(_make_plan_item(f"{creator_topic} creator {loc}", "video", "deterministic", intent_terms))
 
     for topic in topic_terms[:5]:
         intent_terms = [topic] + location_terms[:4]
-        suffixes = ["india", "hindi", "review india", "before after", "routine india"]
-        if gender == "F":
-            suffixes += ["grwm india", "haul hindi", "beauty creator india"]
-        elif mode == "mixed_balanced":
-            suffixes += ["creator india", "vlog hindi"]
+        if "travel" in topic or "trip" in topic:
+            suffixes = ["india", "hindi", "indian youtuber"]
+            if "creator" not in topic:
+                suffixes.append("creator india")
+            if "vlog" not in topic:
+                suffixes.append("vlog india")
+        elif "lifestyle" in topic:
+            suffixes = ["india", "hindi", "day in my life india"]
+            if "vlog" not in topic:
+                suffixes.append("vlog india")
+            if "creator" not in topic:
+                suffixes.append("creator india")
+        else:
+            suffixes = ["india", "hindi", "review india", "before after", "routine india"]
+            if gender == "F":
+                suffixes += ["grwm india", "haul hindi", "beauty creator india"]
+            elif mode == "mixed_balanced":
+                suffixes += ["creator india", "vlog hindi"]
         for token in tokens[:2]:
             creator_topic = _gendered_query(topic, intent, token)
             for suffix in suffixes:
                 plan.append(_make_plan_item(f"{creator_topic} {suffix}", "video", "deterministic", intent_terms))
 
-    if gender == "M":
-        channel_queries = [
-            "mens grooming creator india",
-            "male grooming youtuber india",
-            "men hair care creator india",
-            "men fashion grooming creator india",
-        ]
-    elif gender == "F":
-        channel_queries = [
-            "female beauty creator india",
-            "women skincare youtuber india",
-            "female fashion lifestyle creator india",
-            "indian women lifestyle youtuber",
-        ]
-    elif mode == "mixed_balanced":
-        channel_queries = [
-            "mens grooming creator india",
-            "female beauty creator india",
-            "men fashion lifestyle youtuber india",
-            "women skincare lifestyle youtuber india",
-        ]
-    else:
-        channel_queries = [
-            "indian lifestyle creator",
-            "skincare creator india",
-            "fashion lifestyle youtuber india",
-            "product review creator india",
-        ]
+    channel_queries: list[str] = []
+    for topic in topic_terms[:4]:
+        base = _gendered_query(topic, intent, tokens[0] if tokens else None)
+        channel_queries.append(f"{base} creator india")
+        channel_queries.append(f"{base} youtuber india")
+
+    if not channel_queries:
+        if gender == "M":
+            channel_queries = ["male lifestyle creator india", "indian male youtuber"]
+        elif gender == "F":
+            channel_queries = ["female lifestyle creator india", "indian female youtuber"]
+        elif mode == "mixed_balanced":
+            channel_queries = ["male lifestyle creator india", "female lifestyle creator india"]
+        else:
+            channel_queries = ["indian lifestyle creator", "content creator india"]
+
     for loc in local_terms[:2]:
         if gender == "M":
-            channel_queries.append(f"mens grooming creator {loc}")
-            channel_queries.append(f"male grooming youtuber {loc}")
+            channel_queries.append(f"male creator {loc}")
+            for topic in topic_terms[:2]:
+                channel_queries.append(f"{_gendered_query(topic, intent, tokens[0] if tokens else None)} creator {loc}")
         elif gender == "F":
-            channel_queries.append(f"female beauty creator {loc}")
+            channel_queries.append(f"female creator {loc}")
             channel_queries.append(f"women lifestyle youtuber {loc}")
         elif mode == "mixed_balanced":
             channel_queries.append(f"male creator {loc}")
@@ -658,14 +806,17 @@ def build_yt_hashtag_search_plan(intent: dict, brief: str) -> list[dict]:
     # Derive hashtag candidates from topic terms + niche
     raw_tags: list[str] = []
 
-    if gender == "M":
-        raw_tags += ["mensgrooming", "malegrooming", "skincareformen", "groomingformen", "menskincare"]
-    elif gender == "F":
-        raw_tags += ["indianbeautyblogger", "indianbeautycreator", "womenskincare", "girlsfashion", "beautyroutine", "makeupreview"]
-    elif _gender_mode(intent) == "mixed_balanced":
-        raw_tags += ["mensgrooming", "indianbeautyblogger", "menskincare", "womenskincare", "menfashion", "girlsfashion"]
-    else:
-        raw_tags += ["indiancontentcreator", "skincareroutine", "fashioncreator", "lifestylevlog"]
+    raw_tags += ["indiancontentcreator"]
+    if any("travel" in topic for topic in topic_terms) or "travel" in niche:
+        raw_tags += ["travelvlog", "indiantravelvlogger", "travelcreator", "travelgramindia"]
+    if any("lifestyle" in topic for topic in topic_terms) or "lifestyle" in niche:
+        raw_tags += ["lifestylevlog", "indianlifestyleblogger", "lifestylecreator"]
+    if any("groom" in topic for topic in topic_terms):
+        raw_tags += ["mensgrooming", "malegrooming", "groomingformen"]
+    if any("skin" in topic for topic in topic_terms):
+        raw_tags += ["skincareroutine", "indianskincare"]
+    if any("fashion" in topic or "style" in topic for topic in topic_terms):
+        raw_tags += ["fashioncreator", "indianfashionblogger"]
 
     for topic in topic_terms[:5]:
         slug = re.sub(r"\s+", "", topic.lower())
@@ -835,7 +986,7 @@ Think in creator archetypes, not just keywords:
 - exact niche reviewers/tutorial creators
 - routine/vlog/storytelling creators
 - regional-language creators
-- adjacent lifestyle/fashion/beauty/grooming creators
+- adjacent creators only when they match the brief's niche
 - long-tail micro creators with less obvious titles
 - problem/benefit title patterns such as honest review, before after, under 500, worth it, routine, transformation, GRWM, haul
 
@@ -853,9 +1004,10 @@ Return ONLY valid JSON array. Each item must use this exact shape:
 Rules:
 - Most rows must be search_type "video"; include at most 4 "channel" rows.
 - {gender_rule}
+- Gender words must only constrain who the creator is. Do not switch the niche to grooming, skincare, fashion, or beauty unless the brief explicitly asks for that niche.
 - Queries must contain India/location/language intent where natural.
 - Use real creator title language: review, routine, before after, transformation, vlog, honest, tutorial, under 500, affordable.
-- Include hair color / hair dye / mens grooming combinations when relevant.
+- Include hair color, hair dye, skincare, beauty, fashion, or grooming combinations only when the campaign brief is actually about those topics.
 - If user terms look like hashtags, turn them into YouTube search phrases without #.
 - {avoid_rule}
 - Do not output marketing slogans or brand-only searches.
@@ -1028,6 +1180,48 @@ class AIService:
                 "confidence": "low", "reasoning": "Parse error, using defaults"
             }, brief)
 
+    def generate_grounded_brand_hashtags(self, intent: dict, brief: str) -> dict:
+        """
+        Use Gemini with Google Search grounding to find brand campaign hashtags
+        and current creator hashtags. Falls back gracefully on quota/errors.
+        """
+        text = ""
+        try:
+            text = self._generate(
+                build_brand_hashtag_prompt(intent, brief),
+                temperature=0.2,
+                response_mime_type=None,
+                grounded=True,
+            )
+            parsed = self._parse_json(text, "object")
+
+            def normalize_tag(value: str) -> str:
+                tag = str(value or "").strip()
+                if not tag:
+                    return ""
+                if not tag.startswith("#"):
+                    tag = "#" + tag
+                return "#" + re.sub(r"[^a-zA-Z0-9]", "", tag[1:]).lower()
+
+            brand_tags = [
+                tag for tag in (normalize_tag(t) for t in parsed.get("brand_campaign_tags", []))
+                if len(tag) > 2
+            ][:6]
+            creator_tags = [
+                tag for tag in (normalize_tag(t) for t in parsed.get("trending_creator_tags", []))
+                if len(tag) > 2
+            ][:8]
+            print(f"[AIService] Grounded brand hashtags: {brand_tags}")
+            print(f"[AIService] Grounded trending tags: {creator_tags}")
+            return {
+                "brand_campaign_tags": list(dict.fromkeys(brand_tags)),
+                "trending_creator_tags": list(dict.fromkeys(creator_tags)),
+                "source_note": parsed.get("source_note", ""),
+            }
+        except Exception as e:
+            self._log_parse_error("Brand hashtag grounded search", e, text)
+            return {"brand_campaign_tags": [], "trending_creator_tags": [], "source_note": ""}
+
     def generate_hashtags_raw(self, intent: dict, brief: str) -> list[str]:
         """Generate candidate hashtags (unverified)."""
         text = ""
@@ -1129,12 +1323,78 @@ class AIService:
         strategist = self.generate_strategic_yt_search_plan(intent, brief, user_terms, excludes)
         deterministic = build_deterministic_yt_search_plan(intent, brief)
         hashtag_plan = build_yt_hashtag_search_plan(intent, brief)
-        grounded = (
-            self.generate_grounded_yt_search_plan(intent, brief, user_terms, excludes)
-            if use_grounding and False  # Grounded search has very low quota; disabled to avoid 429s
-            else []
-        )
+        grounded: list[dict] = []
+        if use_grounding and self.gemini_keys.has_keys():
+            print("[AIService] Running grounded YouTube search plan (Google Search enabled)...")
+            try:
+                grounded = self.generate_grounded_yt_search_plan(intent, brief, user_terms, excludes)
+                print(f"[AIService] Grounded plan returned {len(grounded)} queries")
+            except Exception as _grounded_err:
+                print(f"[AIService] Grounded search failed, continuing without it: {_grounded_err}")
+                grounded = []
+        else:
+            reason = "no keys" if not self.gemini_keys.has_keys() else "use_grounding=False"
+            print(f"[AIService] Grounded search skipped ({reason})")
         return merge_yt_search_plans(user_plan, strategist, deterministic, hashtag_plan, grounded)
+
+    def generate_similar_creator_queries(
+        self,
+        creator_inputs: list[str],
+        intent: dict,
+        brief: str,
+    ) -> list[dict]:
+        """Generate YouTube queries to find creators similar to provided references."""
+        if not creator_inputs:
+            return []
+        niche = intent.get("niche", "lifestyle")
+        gender = intent.get("gender", "ANY")
+        locations = intent.get("locations_list", []) or []
+        loc_str = ", ".join(str(loc) for loc in locations[:3]) if locations else "India"
+        tier = intent.get("creator_tier", "micro")
+        creators_str = "\n".join(f"- {creator}" for creator in creator_inputs[:5])
+        prompt = f"""You are planning YouTube searches to find creators similar to given references.
+
+Campaign brief: "{brief}"
+Reference creators (find similar, but not these exact channels):
+{creators_str}
+
+Context:
+- Niche: {niche}
+- Gender target: {gender}
+- Location: {loc_str}
+- Creator tier: {tier}
+
+Generate 4-6 YouTube search queries that would surface similar creators.
+Rules:
+- Same niche and location ({loc_str})
+- Same approximate tier ({tier})
+- Use creator title language: review, routine, vlog, haul, tutorial, transformation
+- Do not put the reference creator names in the queries
+- All queries need India/location context
+
+Return ONLY a JSON array of query strings: ["query 1", "query 2", "query 3"]"""
+        text = ""
+        try:
+            text = self._generate(prompt, temperature=0.4)
+            queries = self._parse_json(text, "array")
+            if not isinstance(queries, list):
+                queries = self._salvage_string_array(text)
+            plan = []
+            for query in queries:
+                q_str = str(query).strip()
+                if q_str and len(q_str) <= 100:
+                    plan.append({
+                        "query": q_str,
+                        "search_type": "video",
+                        "source": "similar_creator",
+                        "intent_terms": [str(niche)] + [str(loc) for loc in locations[:3]],
+                        "negative_terms": list(YT_NEGATIVE_TERMS),
+                        "paginate": False,
+                    })
+            return normalize_yt_search_plan(plan, intent, "similar_creator")
+        except Exception as e:
+            self._log_parse_error("Similar creator query gen", e, text)
+            return []
 
     def generate_ig_keywords(self, intent: dict, brief: str) -> list[str]:
         """Generate Instagram keyword/search phrases, not hashtags."""
@@ -1423,11 +1683,20 @@ Return ONLY valid JSON (no markdown, no explanation):
                 "recent_captions": str(creator.get("recent_captions", ""))[:700],
             }
 
+        locs = intent.get("locations_list", []) or []
+        location_scoring_context = ""
+        if locs:
+            location_scoring_context = (
+                f"\n\nLOCATION CONTEXT: Campaign targets: {', '.join(str(loc) for loc in locs[:6])}. "
+                f"A creator from ANY of these cities/states counts as a location match. "
+                f"Do NOT require 'India' text if an Indian city name is present."
+            )
+
         def score_chunk(chunk: list[dict]) -> dict[str, dict]:
             prompt = f"""You are an Indian influencer marketing talent analyst.
 
 Campaign Brief:
-"{brief}"
+"{brief}"{location_scoring_context}
 
 Evaluate these Instagram profiles. Use local evidence scores as strong signals,
 but correct obvious mistakes. Do not require explicit "India" text; Indian names,
@@ -1541,6 +1810,19 @@ Profiles:
                 "handle": creator.get("handle", ""),
                 "description": str(creator.get("description", ""))[:700],
                 "subscribers": creator.get("subscribers", 0),
+                "subscribers_in_range": (
+                    (intent.get("min_followers", 0) <= creator.get("subscribers", 0) <= intent.get("max_followers", 99999999))
+                    if creator.get("subscribers", 0) > 0 else None
+                ),
+                "subscriber_note": (
+                    f"OVER TARGET ({creator.get('subscribers', 0):,} > {intent.get('max_followers', 0):,})"
+                    if creator.get("subscribers", 0) > intent.get("max_followers", 0) > 0
+                    else (
+                        f"UNDER TARGET ({creator.get('subscribers', 0):,} < {intent.get('min_followers', 0):,})"
+                        if 0 < creator.get("subscribers", 0) < intent.get("min_followers", 0)
+                        else "in range"
+                    )
+                ),
                 "country": creator.get("country", ""),
                 "video_title": creator.get("video_title", ""),
                 "search_query": creator.get("_search_query", ""),
@@ -1573,23 +1855,50 @@ Profiles:
             gender_accept_note = "any real Indian creators — male OR female — who post skincare, beauty, grooming, fashion, or lifestyle content"
             gender_match_rule = "gender_match: true for any real individual creator regardless of gender"
 
+        locs = intent.get("locations_list", []) or []
+        location_scoring_context = ""
+        if locs:
+            location_scoring_context = (
+                f"\n\nLOCATION CONTEXT: Campaign targets these Indian locations: "
+                f"{', '.join(str(loc) for loc in locs[:6])}. A creator from ANY of these cities/states "
+                f"(including sub-cities like Thane for Maharashtra) counts as a location match. "
+                f"Do NOT require the literal word 'India' if an Indian city name is present."
+            )
+
         def score_chunk(chunk: list[dict]) -> dict[str, dict]:
-            prompt = f"""You are a strict YouTube influencer discovery analyst for an Indian agency.
+            min_subs = intent.get("min_followers", 10000)
+            max_subs = intent.get("max_followers", 500000)
+            sub_range_str = f"{min_subs:,} – {max_subs:,} subscribers"
+            prompt = f"""You are a strict YouTube influencer analyst for an Indian influencer marketing agency.
 
 Campaign Brief:
-"{brief}"
+"{brief}"{location_scoring_context}
 
 Gender mode: {campaign_gender_mode}
+Target subscriber range: {sub_range_str}
 
-Evaluate these YouTube channels. The goal is real Indian creator-led channels, not brands,
-stores, salons, clinics, product companies, media channels, or random unrelated channels.
+Evaluate each YouTube channel below. Be STRICT and HONEST with scores — not every creator is a good fit.
 
-High Match requires all of:
-- real person or creator-led channel
-- likely Indian or India-focused
+SCORING RUBRIC (final_score 0–100):
+90–100 : Perfect fit. Right niche, right location, right gender, subscribers inside target range, personal creator with email or contact visible.
+75–89  : Strong fit. Niche matches, India evidence, gender matches, subscribers close to range (within 2×), active creator channel.
+55–74  : Acceptable but needs review. Niche partially matches OR location is inferred not confirmed OR gender is uncertain.
+35–54  : Weak fit. Niche is adjacent/off, OR subscribers way outside range (e.g. 5M when target is 500K max), OR India evidence is thin.
+0–34   : Reject. Brand/business/clinic/store/product channel, OR clearly not Indian, OR completely wrong niche, OR mega-celebrity (>2M subs when target is micro/mid).
+
+SUBSCRIBER RANGE GATE:
+- Target range is {sub_range_str}.
+- If subscribers > 3× max_target ({max_subs * 3:,}), cap final_score at 45 maximum — they are too large for this campaign.
+- If subscribers < 0.1× min_target ({int(min_subs * 0.1):,}), cap final_score at 40 maximum — too small.
+- 0 subscribers means we could not fetch the count — do not penalize, score on other signals.
+
+High Match (match_status: "high") requires ALL of:
+- is_real_creator: true
+- india_confidence: "high" or "medium"
 - {gender_criteria}
-- relevant to the campaign niche or adjacent content
-- not a brand/business/product channel
+- niche_match: true
+- is_business: false
+- final_score >= 68
 
 {gender_reject_note}
 
@@ -1604,18 +1913,17 @@ Return ONLY a JSON array with one object per input:
     "niche_match": true,
     "gender_match": true,
     "is_business": false,
-    "reason": "short evidence-based reason"
+    "reason": "one concise sentence — mention the deciding factor (e.g. 'male grooming creator Mumbai, 180K subs, email in bio' or '3.2M subs exceeds micro target' or 'Ayurvedic brand store, not a creator')"
   }}
 ]
 
 Note on gender_match: {gender_match_rule}
+Note on reason field: always mention subscriber count AND the strongest accept/reject signal.
 
-Reject examples: brand product channels, stores, salons, product brands,
-craft/random channels, international channels with no India evidence.
-Accept/review examples: {gender_accept_note}.
-For mixed/any gender briefs, preserve variety. A female creator and male creator with similar campaign fit should score similarly.
+Accept examples: {gender_accept_note}.
+Reject examples: brand product channels, clinics, salons, mega-celebrities above the subscriber cap.
 
-Profiles:
+Channels to evaluate:
 {json.dumps([compact_creator(c) for c in chunk], ensure_ascii=False)}
 """
             text = ""
@@ -1682,7 +1990,10 @@ Profiles:
             creator["match_status"] = status
             creator["ai_final_score"] = final_score
             creator["ai_score"] = round(final_score / 10, 1)
-            creator["ai_reason"] = scored.get("reason", creator.get("review_reason", "Local YouTube scoring used"))
+            raw_reason = scored.get("reason") or creator.get("review_reason") or "Local YouTube scoring used"
+            subs = creator.get("subscribers", 0)
+            sub_note = f" | {subs:,} subs" if subs else ""
+            creator["ai_reason"] = f"{raw_reason}{sub_note}"
             creator["ai_confidence"] = india_conf
             creator["ai_reject"] = status == "rejected"
             creator["ai_review_needed"] = status == "review"
@@ -1744,6 +2055,8 @@ Profiles:
         hashtag_search_terms: list[str] = []
         yt_search_plan: list[dict] = []
         yt_queries: list[str] = []
+        brand_campaign_tags: list[str] = []
+        trending_creator_tags: list[str] = []
 
         # ── Instagram path ─────────────────────────────────────────────────────
         if do_ig:
@@ -1772,6 +2085,13 @@ Profiles:
             log("[AIService] Instagram skipped (platform not selected)")
 
         # ── YouTube path ───────────────────────────────────────────────────────
+        if self.gemini_keys.has_keys():
+            log("[AIService] Discovering brand-specific + trending hashtags via grounded Gemini...")
+            brand_result = self.generate_grounded_brand_hashtags(intent, brief)
+            brand_campaign_tags = brand_result.get("brand_campaign_tags", [])
+            trending_creator_tags = brand_result.get("trending_creator_tags", [])
+            log(f"[AIService] Brand tags: {brand_campaign_tags} | Trending: {trending_creator_tags}")
+
         if do_yt:
             log("[AIService] Strategic YouTube search planning...")
             yt_search_plan = self.generate_yt_search_plan(
@@ -1799,4 +2119,6 @@ Profiles:
             "yt_queries": yt_queries,
             "user_search_terms": user_terms,
             "exclude_terms": excludes,
+            "brand_campaign_tags": brand_campaign_tags,
+            "trending_creator_tags": trending_creator_tags,
         }

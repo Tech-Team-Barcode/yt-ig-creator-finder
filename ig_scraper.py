@@ -1,9 +1,8 @@
-"""Instagram creator discovery funnel.
-
-This module intentionally avoids keyword search and unsafe snowball scraping.
-It consumes already-planned hashtags, scrapes public hashtag posts with the
-current Apify schema, enriches candidate profiles, and applies local evidence
-scoring before Gemini ranking in app.py.
+"""Instagram creator discovery funnels.
+ig_scraper.py
+The live workflow expands Instagram handles found on YouTube creator results
+through a bounded related-profile graph and enriches each public profile.
+The older hashtag funnel remains available for legacy callers.
 """
 
 from __future__ import annotations
@@ -18,6 +17,13 @@ import aiohttp
 from backend_keys import KeyRing, parse_keys
 from hashtag_planner import evaluate_hashtag_quality, normalize_hashtag
 
+try:
+    from debug_logger import log_ig_raw
+    _DEBUG_LOG = True
+except ImportError:
+    _DEBUG_LOG = False
+    def log_ig_raw(*a, **k): pass
+
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -25,11 +31,22 @@ if sys.platform.startswith("win"):
 APIFY_BASE = "https://api.apify.com/v2"
 ACTOR_HASHTAG = "apify~instagram-hashtag-scraper"
 ACTOR_PROFILE = "apify~instagram-profile-scraper"
+ACTOR_RELATED_PROFILE = "figue~instagram-profile-scraper"
 
 POSTS_PER_HASHTAG = 30
-MAX_CANDIDATES_BEFORE_ENRICH = 80
+MAX_CANDIDATES_BEFORE_ENRICH = 150
 ENRICH_BATCH_SIZE = 20
 ENRICH_TIMEOUT = 240
+RELATED_PROFILE_BATCH_SIZE = 50
+RELATED_PROFILE_DEPTH = 2
+MAX_RELATED_PER_PROFILE = 50
+MAX_RELATED_PER_HOP = 1000
+
+INSTAGRAM_RESERVED_PATHS = {
+    "about", "accounts", "developer", "direct", "directory", "emails",
+    "explore", "legal", "p", "press", "privacy", "reel", "reels",
+    "stories", "terms", "tv", "web",
+}
 
 SPAM_TAGS = {
     "love", "photo", "picture", "follow", "like", "instagram", "insta",
@@ -105,6 +122,15 @@ NON_INDIA_RE = re.compile(
     r"melbourne|los\s*angeles|chicago|paris|berlin|amsterdam|bangkok|"
     r"manila|karachi|lahore|dhaka|colombo|kathmandu)|"
     r"(uk|us|uae|usa|american|british|australian)\s*creator)\b",
+    re.IGNORECASE,
+)
+
+FOREIGN_SIGNAL_RE = re.compile(
+    r"\b(china|chinese|beijing|shanghai|guangzhou|shenzhen|sweden|swedish|"
+    r"korea|korean|seoul|japan|japanese|tokyo|usa|united\s*states|america|"
+    r"canada|toronto|uk|united\s*kingdom|london|australia|sydney|"
+    r"dubai|uae|singapore|malaysia|indonesia|thailand|bangkok|"
+    r"pakistan|karachi|lahore|bangladesh|dhaka|sri\s*lanka|colombo)\b",
     re.IGNORECASE,
 )
 
@@ -198,7 +224,12 @@ async def _run_actor(
             ) as resp:
                 if resp.status in (401, 403, 429):
                     keys.mark_exhausted(key)
-                    log(f"{actor_id} key exhausted/blocked; rotating")
+                    reason = {
+                        401: "unauthorized token",
+                        403: "forbidden or actor access not enabled",
+                        429: "rate limited or quota exhausted",
+                    }[resp.status]
+                    log(f"{actor_id} HTTP {resp.status} ({reason}); rotating key")
                     continue
                 if resp.status == 502:
                     log(f"{actor_id} returned 502; skipping call")
@@ -375,9 +406,9 @@ def pre_filter_candidates(posts: list[dict], niche: str) -> list[dict]:
 
 
 def _profile_external_text(raw: dict) -> tuple[str, str]:
-    external_url = str(raw.get("externalUrl") or raw.get("websiteUrl") or "")
+    external_url = str(raw.get("externalUrl") or raw.get("external_url") or raw.get("websiteUrl") or "")
     pieces = [external_url]
-    for key in ("externalUrls", "bioLinks"):
+    for key in ("externalUrls", "bioLinks", "external_urls", "bio_links"):
         values = raw.get(key) or []
         if isinstance(values, list):
             for item in values:
@@ -634,9 +665,9 @@ def apply_local_profile_scoring(
         reject_reason = "business/store profile"
     elif business_risk >= 50 and niche_conf < 60:
         reject_reason = "business/store profile"
-    elif niche_conf < 35:
+    elif niche_conf < 25:
         reject_reason = "weak niche evidence"
-    elif niche_conf < 50 and creator_conf < 35:
+    elif niche_conf < 40 and creator_conf < 30:
         reject_reason = "weak niche/creator evidence"
     elif gender_filter != "ANY" and gender_conf < 25:
         reject_reason = "gender anti-match"
@@ -708,6 +739,309 @@ def post_enrich_filter(
         -int(c.get("followers") or 0),
     ))
     return scored
+
+
+def apply_instagram_graph_gate(
+    creators: list[dict],
+    location_hints: list[str],
+    include_rejected: bool = False,
+) -> list[dict]:
+    """Keep graph expansion broad, but only surface brief/location-fit rows."""
+    require_location = bool([hint for hint in location_hints if str(hint).strip()])
+    gated: list[dict] = []
+    for creator in creators:
+        india_conf = _safe_int(creator.get("india_confidence"), 0)
+        text = _clean_text(
+            creator.get("username"),
+            creator.get("full_name"),
+            creator.get("bio"),
+            creator.get("recent_captions"),
+            creator.get("external_url"),
+        )
+        if creator.get("match_status") != "rejected":
+            if require_location and india_conf < 25:
+                creator["match_status"] = "rejected"
+                creator["reject_reason"] = "missing India/location evidence"
+            elif india_conf < 25 and FOREIGN_SIGNAL_RE.search(text):
+                creator["match_status"] = "rejected"
+                creator["reject_reason"] = "foreign profile without India evidence"
+            elif india_conf >= 25 and FOREIGN_SIGNAL_RE.search(text):
+                creator["review_reason"] = creator.get("review_reason") or "has foreign signal; review India fit"
+                if creator.get("match_status") == "high":
+                    creator["match_status"] = "review"
+        if include_rejected or creator.get("match_status") != "rejected":
+            gated.append(creator)
+    gated.sort(key=lambda c: (
+        0 if c.get("match_status") == "high" else 1,
+        -float(c.get("local_match_score") or 0),
+        int(c.get("ig_discovery_depth") or 0),
+        -int(c.get("followers") or 0),
+    ))
+    return gated
+
+
+def normalize_instagram_username(value: object) -> str:
+    """Normalize an Instagram URL, @handle, or plain handle to a username."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    match = re.search(
+        r"(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9._]{2,30})(?:[/?#]|$)",
+        text,
+        re.IGNORECASE,
+    )
+    if match:
+        text = match.group(1)
+    else:
+        text = text.lstrip("@").split("?", 1)[0].split("#", 1)[0].strip("/")
+    if not re.fullmatch(r"[A-Za-z0-9._]{2,30}", text):
+        return ""
+    username = text.lower()
+    return "" if username in INSTAGRAM_RESERVED_PATHS else username
+
+
+def instagram_seeds_from_youtube(creators: list[dict]) -> list[dict]:
+    """Collect unique Instagram seeds exposed by completed YouTube result rows."""
+    seeds: dict[str, dict] = {}
+    for creator in creators:
+        if creator.get("platform") != "youtube":
+            continue
+        username = ""
+        for field in ("instagram_url", "instagram", "instagram_handle", "ig_username", "ig_handle"):
+            username = normalize_instagram_username(creator.get(field))
+            if username:
+                break
+        if not username:
+            continue
+        if username not in seeds:
+            seeds[username] = {
+                "username": username,
+                "seed_username": username,
+                "source_username": username,
+                "discovery_depth": 0,
+                "source_youtube_channel": str(creator.get("channel_name") or creator.get("handle") or ""),
+                "source_youtube_url": str(creator.get("channel_url") or creator.get("handle_url") or ""),
+            }
+    return list(seeds.values())
+
+
+def _related_usernames(raw: dict) -> list[str]:
+    """Read related handles across the documented and common Instagram shapes."""
+    values = (
+        raw.get("edge_related_profiles")
+        or raw.get("relatedProfiles")
+        or raw.get("related_profiles")
+        or []
+    )
+    if isinstance(values, dict):
+        values = values.get("edges") or values.get("nodes") or values.get("items") or []
+    usernames: list[str] = []
+    if not isinstance(values, list):
+        return usernames
+    for item in values:
+        node = item.get("node", item) if isinstance(item, dict) else item
+        candidate = (
+            node.get("username") or node.get("userName") or node.get("url") or ""
+            if isinstance(node, dict)
+            else node
+        )
+        username = normalize_instagram_username(candidate)
+        if username and username not in usernames:
+            usernames.append(username)
+    return usernames
+
+
+def _figue_profile_to_creator(raw: dict, provenance: dict) -> Optional[dict]:
+    username = normalize_instagram_username(raw.get("username") or provenance.get("username"))
+    if not username:
+        return None
+    external_url, external_text = _profile_external_text(raw)
+    latest_captions, latest_hashtags, latest_url = _latest_post_context(raw)
+    latest_posts = raw.get("latestPosts") or raw.get("latest_posts") or raw.get("posts") or []
+    if not isinstance(latest_posts, list):
+        latest_posts = []
+    latest_reel_url = next(
+        (
+            str(post.get("video_url") or post.get("videoUrl") or "")
+            for post in latest_posts
+            if isinstance(post, dict) and (post.get("video_url") or post.get("videoUrl"))
+        ),
+        "",
+    )
+    bio = str(raw.get("biography") or raw.get("bio") or "")
+    related = _related_usernames(raw)
+    email = str(raw.get("business_email") or raw.get("businessEmail") or "").strip()
+    phone = str(raw.get("business_phone_number") or raw.get("businessPhoneNumber") or "").strip()
+    return {
+        "platform": "instagram",
+        "username": username,
+        "full_name": str(raw.get("full_name") or raw.get("fullName") or ""),
+        "bio": bio,
+        "caption": latest_captions,
+        "recent_captions": latest_captions,
+        "hashtags": latest_hashtags,
+        "source_hashtags": [],
+        "followers": _safe_int(raw.get("followersCount") or raw.get("followers"), 0),
+        "following": _safe_int(raw.get("followsCount") or raw.get("following"), 0),
+        "posts_count": _safe_int(raw.get("postsCount") or raw.get("mediaCount"), 0),
+        "is_private": bool(raw.get("is_private") or raw.get("private") or raw.get("isPrivate")),
+        "is_business": bool(raw.get("is_business_account") or raw.get("isBusinessAccount") or raw.get("isBusiness")),
+        "business_category": str(raw.get("category_name") or raw.get("businessCategoryName") or raw.get("category") or ""),
+        "profile_url": f"https://www.instagram.com/{username}/",
+        "external_url": external_url,
+        "thumbnail": str(raw.get("profile_pic_url_hd") or raw.get("profilePicUrlHD") or raw.get("profile_pic_url") or raw.get("profilePicUrl") or ""),
+        "is_verified": bool(raw.get("is_verified") or raw.get("verified") or raw.get("isVerified")),
+        "sample_post_url": latest_url,
+        "latest_posts": latest_posts[:12],
+        "latest_reel_url": latest_reel_url,
+        "email": email or _extract_email(_clean_text(bio, external_text)),
+        "phone": phone or _extract_phone(_clean_text(bio, external_text)),
+        "related_profiles": related,
+        "ig_discovery_source": "youtube_seed" if provenance.get("discovery_depth", 0) == 0 else "related_profile",
+        "ig_discovery_depth": int(provenance.get("discovery_depth", 0)),
+        "ig_seed_username": str(provenance.get("seed_username") or username),
+        "ig_parent_username": str(provenance.get("source_username") or ""),
+        "source_youtube_channel": str(provenance.get("source_youtube_channel") or ""),
+        "source_youtube_url": str(provenance.get("source_youtube_url") or ""),
+        "enriched": True,
+    }
+
+
+async def _scrape_figue_profiles(
+    session: aiohttp.ClientSession,
+    keys: KeyRing,
+    targets: list[dict],
+    log: Callable[[str], None],
+) -> list[tuple[dict, dict]]:
+    results: list[tuple[dict, dict]] = []
+    for start in range(0, len(targets), RELATED_PROFILE_BATCH_SIZE):
+        chunk = targets[start:start + RELATED_PROFILE_BATCH_SIZE]
+        usernames = [str(item.get("username") or "") for item in chunk if item.get("username")]
+        payload = {"profiles": usernames, "includeRecentPosts": True}
+        rows = await _run_actor(session, ACTOR_RELATED_PROFILE, payload, keys, timeout=ENRICH_TIMEOUT, log=log)
+        provenance = {item["username"]: item for item in chunk if item.get("username")}
+        for raw in rows:
+            if not isinstance(raw, dict):
+                continue
+            username = normalize_instagram_username(raw.get("username"))
+            if username and username in provenance:
+                results.append((raw, provenance[username]))
+        log(f"Instagram graph batch {start // RELATED_PROFILE_BATCH_SIZE + 1}: {len(rows)} returned")
+    return results
+
+
+async def run_ig_related_search_from_youtube(
+    yt_creators: list[dict],
+    profile_api_keys: str | Iterable[str],
+    min_followers: int,
+    max_followers: int,
+    location_hints: list[str],
+    gender_filter: str = "ANY",
+    niche: str = "",
+    progress_callback: Optional[Callable[[str], None]] = None,
+    related_depth: int = RELATED_PROFILE_DEPTH,
+    max_related_per_profile: int = MAX_RELATED_PER_PROFILE,
+    max_related_per_hop: int = MAX_RELATED_PER_HOP,
+    include_rejected: bool = False,
+    debug_state: Optional[dict] = None,
+) -> list[dict]:
+    """Discover Instagram creators from YouTube-linked profiles and their graph."""
+
+    def log(message: str) -> None:
+        print(f"[IG Graph] {message}")
+        if progress_callback:
+            try:
+                progress_callback(message)
+            except Exception:
+                pass
+
+    seeds = instagram_seeds_from_youtube(yt_creators)
+    debug = debug_state if debug_state is not None else {}
+    debug.clear()
+    debug.update({
+        "youtube_seed_profiles": len(seeds),
+        "levels": [],
+        "fetched_profiles": 0,
+        "sample_profile_fields": [],
+        "related_field_names": [],
+        "related_profiles_discovered": 0,
+    })
+    if not seeds:
+        log("No YouTube creators exposed an Instagram handle")
+        return []
+
+    profile_keys = KeyRing(profile_api_keys)
+    if not profile_keys.has_keys():
+        log("Missing Apify profile keys")
+        return []
+
+    max_depth = max(0, min(int(related_depth), 2))
+    per_profile_limit = max(1, int(max_related_per_profile))
+    hop_limit = max(1, int(max_related_per_hop))
+    fetched: set[str] = set()
+    creators: dict[str, dict] = {}
+    frontier = seeds
+
+    log(f"Instagram graph: {len(seeds)} YouTube-linked seed profile(s), {max_depth} related hop(s)")
+    async with aiohttp.ClientSession() as session:
+        for depth in range(max_depth + 1):
+            pending = [item for item in frontier if item["username"] not in fetched]
+            if not pending:
+                break
+            fetched.update(item["username"] for item in pending)
+            scraped = await _scrape_figue_profiles(session, profile_keys, pending, log)
+            next_targets: dict[str, dict] = {}
+            for raw, provenance in scraped:
+                if not debug["sample_profile_fields"]:
+                    debug["sample_profile_fields"] = sorted(str(key) for key in raw.keys())
+                for key in raw:
+                    if ("related" in str(key).lower() or "edge" in str(key).lower()) and str(key) not in debug["related_field_names"]:
+                        debug["related_field_names"].append(str(key))
+                creator = _figue_profile_to_creator(raw, provenance)
+                if not creator:
+                    continue
+                creators[creator["username"]] = creator
+                debug["related_profiles_discovered"] += len(creator.get("related_profiles", []))
+                if depth >= max_depth:
+                    continue
+                for related_username in creator.get("related_profiles", [])[:per_profile_limit]:
+                    if related_username in fetched or related_username in next_targets:
+                        continue
+                    next_targets[related_username] = {
+                        "username": related_username,
+                        "seed_username": creator["ig_seed_username"],
+                        "source_username": creator["username"],
+                        "discovery_depth": depth + 1,
+                        "source_youtube_channel": creator["source_youtube_channel"],
+                        "source_youtube_url": creator["source_youtube_url"],
+                    }
+            frontier = list(next_targets.values())[:hop_limit]
+            debug["levels"].append({
+                "depth": depth,
+                "requested": len(pending),
+                "returned": len(scraped),
+                "next_related": len(frontier),
+            })
+            log(f"Depth {depth}: enriched {len(scraped)} profile(s); queued {len(frontier)} related profile(s)")
+
+    debug["fetched_profiles"] = len(creators)
+    if not creators:
+        log("Instagram actor returned no enriched profiles")
+        return []
+
+    scored = post_enrich_filter(
+        list(creators.values()),
+        min_followers=min_followers,
+        max_followers=max_followers,
+        gender_filter=gender_filter,
+        location_hints=location_hints,
+        niche=niche,
+    )
+    gated = apply_instagram_graph_gate(scored, location_hints, include_rejected=include_rejected)
+    debug["surface_profiles"] = len(gated)
+    debug["rejected_or_hidden"] = len(scored) - len(gated)
+    log(f"Instagram graph complete: {len(scored)} enriched profile(s), {len(gated)} surfaced after brief/location gate")
+    return gated
 
 
 async def run_ig_search(
@@ -791,6 +1125,10 @@ async def run_ig_search(
         candidates = pre_filter_candidates(all_posts, niche)
         debug["funnel"]["pre_filter_candidates"] = len(candidates)
         log(f"Pre-filter: {len(all_posts)} posts -> {len(candidates)} candidate usernames")
+        
+        # DEBUG: log all posts and pre-filter result
+        if _DEBUG_LOG:
+            log_ig_raw(all_posts, candidates)
 
         per_tag_candidates: dict[str, int] = {tag.lstrip("#"): 0 for tag in seed_tags}
         for candidate in candidates:

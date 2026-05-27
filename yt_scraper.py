@@ -1,4 +1,5 @@
 """
+yt_scraper.py
 YouTube Creator Scraper.
 
 Uses the YouTube Data API v3 directly. The search layer accepts a structured
@@ -14,6 +15,13 @@ import re
 from typing import Optional
 
 import aiohttp
+
+try:
+    from debug_logger import log_yt_raw
+    _DEBUG_LOG = True
+except ImportError:
+    _DEBUG_LOG = False
+    def log_yt_raw(*a, **k): pass
 
 
 YT_API_BASE = "https://www.googleapis.com/youtube/v3"
@@ -148,6 +156,117 @@ NICHES_RE = re.compile(
     r"face care|fashion|style|lifestyle|review|routine|before after)\b",
     re.IGNORECASE,
 )
+
+
+# State -> expanded location terms (mirrors GAS KANNADA_HINTS approach from sirs.txt)
+# When a brief says "Maharashtra", we match maharashtra, mumbai, pune, nagpur, etc.
+INDIA_LOCATION_MAP: dict[str, list[str]] = {
+    "maharashtra": [
+        "maharashtra", "mumbai", "pune", "nagpur", "nashik", "aurangabad",
+        "kolhapur", "thane", "navi mumbai", "solapur", "amravati",
+        "marathi", "mumbaikar", "punekar", "namma mumbai",
+    ],
+    "gujarat": [
+        "gujarat", "gujarati", "ahmedabad", "surat", "vadodara", "rajkot",
+        "gandhinagar", "bhavnagar", "jamnagar", "junagadh", "anand",
+        "amdavadi", "surti", "baroda",
+    ],
+    "delhi": [
+        "delhi", "new delhi", "dilli", "ncr", "gurgaon", "gurugram",
+        "noida", "faridabad", "ghaziabad", "dwarka", "janakpuri",
+        "rohini", "south delhi", "east delhi", "west delhi",
+    ],
+    "karnataka": [
+        "karnataka", "kannada", "kannadiga", "bengaluru", "bangalore",
+        "mysore", "mysuru", "mangalore", "mangaluru", "hubli", "belgaum",
+        "udupi", "tulu", "sandalwood", "namma",
+    ],
+    "tamil_nadu": [
+        "tamil", "tamilnadu", "tamil nadu", "chennai", "madras", "coimbatore",
+        "madurai", "trichy", "salem", "tirunelveli",
+    ],
+    "telangana": [
+        "telangana", "telugu", "hyderabad", "secunderabad", "warangal",
+        "karimnagar", "nizamabad", "hyd",
+    ],
+    "andhra_pradesh": [
+        "andhra", "andhra pradesh", "visakhapatnam", "vizag", "vijayawada",
+        "guntur", "tirupati",
+    ],
+    "rajasthan": [
+        "rajasthan", "rajasthani", "jaipur", "jodhpur", "udaipur", "kota",
+        "ajmer", "bikaner", "pinkcity",
+    ],
+    "madhya_pradesh": [
+        "madhya pradesh", "mp", "indore", "bhopal", "gwalior", "jabalpur",
+        "ujjain", "indori",
+    ],
+    "punjab": [
+        "punjab", "punjabi", "chandigarh", "ludhiana", "amritsar", "jalandhar",
+        "patiala", "mohali",
+    ],
+    "uttar_pradesh": [
+        "uttar pradesh", "up", "lucknow", "kanpur", "varanasi", "agra",
+        "prayagraj", "allahabad", "meerut", "gorakhpur",
+    ],
+    "kerala": [
+        "kerala", "malayalam", "kochi", "cochin", "thiruvananthapuram",
+        "trivandrum", "kozhikode", "calicut", "thrissur", "malappuram",
+    ],
+    "west_bengal": [
+        "west bengal", "bengali", "kolkata", "calcutta", "howrah",
+        "siliguri", "durgapur",
+    ],
+    "haryana": [
+        "haryana", "haryanvi", "gurgaon", "gurugram", "faridabad",
+        "rohtak", "hisar", "panipat",
+    ],
+    "bihar": [
+        "bihar", "bihari", "patna", "gaya", "bhagalpur", "muzaffarpur",
+    ],
+    "assam": [
+        "assam", "assamese", "guwahati", "dibrugarh", "jorhat", "silchar",
+    ],
+    "goa": [
+        "goa", "goan", "panaji", "margao", "vasco", "konkani",
+    ],
+}
+
+
+def _expand_location_hints(location_hints: list[str]) -> list[str]:
+    """
+    Expand bare state/region names to their full city+language+culture term list.
+    Mirrors the KANNADA_HINTS approach from the GAS reference system (sirs.txt).
+    e.g. ["maharashtra", "gujarat"] -> ["maharashtra", "mumbai", "pune", "nagpur",
+         "gujarat", "gujarati", "ahmedabad", "surat", ...]
+    """
+    expanded: list[str] = []
+    added: set[str] = set()
+
+    def add(term: str) -> None:
+        t = term.strip().lower()
+        if t and t not in added:
+            added.add(t)
+            expanded.append(t)
+
+    for hint in (location_hints or []):
+        hint_lower = str(hint or "").strip().lower()
+        if not hint_lower:
+            continue
+        matched = False
+        for state_key, terms in INDIA_LOCATION_MAP.items():
+            if hint_lower == state_key.replace("_", " ") or hint_lower in terms:
+                for term in terms:
+                    add(term)
+                matched = True
+                break
+        if not matched:
+            add(hint_lower)
+
+    for generic in ("india", "indian", "hindi"):
+        add(generic)
+
+    return expanded
 
 
 def _safe_int(value, default: int = 0) -> int:
@@ -487,20 +606,27 @@ def _india_score(ch: dict, match: dict, location_hints: list[str]) -> tuple[int,
         sn.get("description", "") or "",
         ((ch.get("brandingSettings") or {}).get("channel", {}) or {}).get("keywords", "") or "",
         video_text,
-    ])
-    query = match.get("query", "") or ""
+    ]).lower()
+    query = (match.get("query", "") or "").lower()
+
+    expanded_hints = _expand_location_hints(location_hints)
+
     score = 0
     if country == "IN":
         score += 3
     if INDIA_SIGNAL_RE.search(full):
         score += 2
-    if any(hint and hint.lower() in full.lower() for hint in location_hints):
-        score += 2
+
+    location_hits = sum(1 for hint in expanded_hints if hint in full)
+    score += min(location_hits, 3)
+
+    query_location_hits = sum(1 for hint in expanded_hints if hint in query)
+    if query_location_hits > 0:
+        score += 1
+
     if INDIAN_MALE_NAME_RE.search(full) or INDIAN_FEMALE_NAME_RE.search(full):
         score += 1
     if INDIAN_BRANDS_RE.search(full):
-        score += 1
-    if INDIA_SIGNAL_RE.search(query):
         score += 1
 
     if score >= 4:
@@ -611,37 +737,61 @@ def _normalize_channel(
     if creator_score < 1:
         return None
 
-    loc_hints = _expand_hints(location_hints)
+    loc_hints = _expand_location_hints(_expand_hints(location_hints))
     india_score, india_conf = _india_score(ch, match, loc_hints)
 
-    # India gate: if region is IN and country is blank, require at least 1 india signal.
-    # If allow_international, skip this gate entirely.
-    if not allow_international and region.upper() == "IN" and not country and india_score < 1:
-        return None
+    # FIXED: Only hard-reject India gate if country is explicitly set to non-IN
+    # and there are zero India signals. Blank country = benefit of doubt.
+    if not allow_international and country and country != region.upper():
+        return None  # explicit foreign country
+    if not allow_international and not country and india_score < 0:
+        return None  # impossible to reach, but kept as safety
 
     gender_score, female_conflict = _gender_score(ch, match)
     female_score, male_conflict = _female_score(ch, match)
     inferred_gender = _gender_label(gender_score, female_score)
     if gender_filter == "M":
-        channel_gender_text = " ".join([title, custom_url, desc[:500]])
-        channel_male_signal = bool(
-            MALE_CHANNEL_SIGNAL_RE.search(channel_gender_text)
-            or MALE_COMPACT_RE.search(_compact(channel_gender_text))
-            or INDIAN_MALE_NAME_RE.search(channel_gender_text)
-        )
-        if female_conflict or gender_score <= 0:
+        if INDIAN_FEMALE_NAME_RE.search(title):
             return None
-        if not channel_male_signal:
+
+        title_handle_text = " ".join([title, custom_url])
+        title_has_female = bool(FEMALE_CHANNEL_SIGNAL_RE.search(title_handle_text))
+        title_has_male = bool(
+            MALE_CHANNEL_SIGNAL_RE.search(title_handle_text)
+            or MALE_COMPACT_RE.search(_compact(title_handle_text))
+        )
+        if title_has_female and not title_has_male:
+            return None
+
+        has_any_male_signal = (
+            INDIAN_MALE_NAME_RE.search(title)
+            or title_has_male
+            or gender_score > 0
+        )
+        if not has_any_male_signal:
             return None
     elif gender_filter == "F":
-        channel_gender_text = " ".join([title, custom_url, desc[:500]])
-        channel_female_signal = bool(
-            FEMALE_CHANNEL_SIGNAL_RE.search(channel_gender_text)
-            or INDIAN_FEMALE_NAME_RE.search(channel_gender_text)
-        )
-        if male_conflict or female_score <= 0:
+        if INDIAN_MALE_NAME_RE.search(title):
             return None
-        if not channel_female_signal:
+
+        title_handle_text = " ".join([title, custom_url])
+        title_has_male_f = bool(
+            MALE_CHANNEL_SIGNAL_RE.search(title_handle_text)
+            or MALE_COMPACT_RE.search(_compact(title_handle_text))
+        )
+        title_has_female_f = bool(
+            FEMALE_CHANNEL_SIGNAL_RE.search(title_handle_text)
+            or INDIAN_FEMALE_NAME_RE.search(title_handle_text)
+        )
+        if title_has_male_f and not title_has_female_f:
+            return None
+
+        has_any_female_signal = (
+            INDIAN_FEMALE_NAME_RE.search(title)
+            or title_has_female_f
+            or female_score > 0
+        )
+        if not has_any_female_signal:
             return None
 
     niche_score = _niche_score(ch, match)
@@ -877,6 +1027,10 @@ async def run_yt_search(
         batch_results = await asyncio.gather(*batch_tasks)
         for result in batch_results:
             all_channels.update(result)
+
+        # DEBUG: log all channels before filtering
+        if _DEBUG_LOG:
+            log_yt_raw(all_channels, channel_matches)
 
         results: list[dict] = []
         for cid, ch in all_channels.items():
