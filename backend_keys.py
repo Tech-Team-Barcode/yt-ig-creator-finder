@@ -68,15 +68,31 @@ def parse_keys(raw: str | Iterable[str] | None) -> list[str]:
             parts.extend(KEY_SPLIT_RE.split(str(item).strip()))
     keys: list[str] = []
     for part in parts:
-        key = part.strip().strip("'\"")
+        key = part.strip().strip("[]'\"")
         if key and key not in keys:
             keys.append(key)
     return keys
 
 
+def streamlit_secret_keys(name: str) -> list[str]:
+    """Read root-level Streamlit secrets when running on Streamlit Cloud.
+
+    Streamlit TOML arrays live in st.secrets. Root-level scalar secrets may also
+    be exposed as environment variables, but arrays are safer to read here.
+    """
+    try:
+        import streamlit as st
+
+        if name in st.secrets:
+            return parse_keys(st.secrets.get(name))
+    except Exception:
+        pass
+    return []
+
+
 def env_keys(name: str) -> list[str]:
     load_dotenv_once()
-    return parse_keys(os.getenv(name, ""))
+    return first_non_empty(parse_keys(os.getenv(name, "")), streamlit_secret_keys(name))
 
 
 def first_non_empty(*groups: Iterable[str]) -> list[str]:
